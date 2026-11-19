@@ -1,0 +1,464 @@
+package sqlite
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/openclaw/clickclack/apps/api/internal/store"
+)
+
+func TestListWorkspaceMemberPagePaginatesFiltersAndSearches(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	owner, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Owner", Email: "members-owner@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultWorkspaceMember(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "members-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, moderator.ID, store.WorkspaceRoleModerator); err != nil {
+		t.Fatal(err)
+	}
+	alpha, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Alpha", Email: "members-alpha@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, alpha.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	beta, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "beta", Email: "members-beta@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, beta.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	percent, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "100% Real", Email: "members-percent@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, percent.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "members-guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+
+	defaultPage, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultPage.TotalCount == nil || *defaultPage.TotalCount != 6 {
+		t.Fatalf("expected default total count 6, got %#v", defaultPage.TotalCount)
+	}
+	if defaultPage.TotalByRole == nil {
+		t.Fatal("expected default first page to include role totals")
+	}
+	if got := *defaultPage.TotalByRole; got.Owner != 1 || got.Moderator != 1 || got.Member != 3 || got.Bot != 0 || got.Guest != 1 {
+		t.Fatalf("unexpected default role totals: %#v", got)
+	}
+
+	first, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Limit: 2, Role: store.WorkspaceRoleMember})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.HasMore || first.NextCursor == "" {
+		t.Fatalf("expected more member results, got %#v", first)
+	}
+	if first.TotalCount == nil || *first.TotalCount != 3 {
+		t.Fatalf("expected first-page member count 3, got %#v", first.TotalCount)
+	}
+	if first.TotalByRole != nil {
+		t.Fatalf("expected role-filter page to omit role totals, got %#v", first.TotalByRole)
+	}
+	if got := memberNames(first.Members); len(got) != 2 || got[0] != "100% Real" || got[1] != "Alpha" {
+		t.Fatalf("unexpected first page order: %#v", got)
+	}
+	if first.Members[0].WorkspaceID != workspace.ID || first.Members[0].JoinedAt == "" {
+		t.Fatalf("expected workspace membership metadata, got %#v", first.Members[0])
+	}
+
+	second, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Limit: 2, Role: store.WorkspaceRoleMember, Cursor: first.NextCursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.HasMore || second.NextCursor != "" {
+		t.Fatalf("expected final page, got %#v", second)
+	}
+	if second.TotalCount != nil {
+		t.Fatalf("expected cursor page to omit total count, got %#v", second.TotalCount)
+	}
+	if second.TotalByRole != nil {
+		t.Fatalf("expected cursor page to omit role totals, got %#v", second.TotalByRole)
+	}
+	if got := memberNames(second.Members); len(got) != 1 || got[0] != "beta" {
+		t.Fatalf("unexpected second page order: %#v", got)
+	}
+
+	search, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Query: "ALP"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if search.TotalCount == nil || *search.TotalCount != 1 {
+		t.Fatalf("expected search count 1, got %#v", search.TotalCount)
+	}
+	if search.TotalByRole != nil {
+		t.Fatalf("expected search page to omit role totals, got %#v", search.TotalByRole)
+	}
+	if got := memberNames(search.Members); len(got) != 1 || got[0] != "Alpha" {
+		t.Fatalf("unexpected search results: %#v", got)
+	}
+	literalPercent, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Query: "%"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if literalPercent.TotalCount == nil || *literalPercent.TotalCount != 1 {
+		t.Fatalf("expected literal percent count 1, got %#v", literalPercent.TotalCount)
+	}
+	if got := memberNames(literalPercent.Members); len(got) != 1 || got[0] != "100% Real" {
+		t.Fatalf("expected literal percent search, got %#v", got)
+	}
+
+	_, err = st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Limit: 2, Role: store.WorkspaceRoleGuest, Cursor: first.NextCursor})
+	if !errors.Is(err, store.ErrInvalidWorkspaceMemberPage) {
+		t.Fatalf("expected cursor filter mismatch rejection, got %v", err)
+	}
+
+	if _, err := st.UpdateUserProfile(ctx, store.UpdateUserProfileInput{
+		UserID:      beta.ID,
+		DisplayName: "000 First",
+		Handle:      "first-member",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{
+		Role:  store.WorkspaceRoleMember,
+		Limit: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := memberNames(renamed.Members); len(got) != 3 || got[0] != "000 First" {
+		t.Fatalf("expected profile update to refresh indexed member order, got %#v", got)
+	}
+	renamedSearch, err := st.ListWorkspaceMemberPage(ctx, workspace.ID, alpha.ID, store.WorkspaceMemberPageRequest{Query: "first-member"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := memberNames(renamedSearch.Members); len(got) != 1 || got[0] != "000 First" {
+		t.Fatalf("expected profile update to refresh indexed member search, got %#v", got)
+	}
+}
+
+func TestWorkspaceMemberPageUsesRangeIndex(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	rows, err := st.db.QueryContext(ctx, `
+		EXPLAIN QUERY PLAN
+		SELECT u.id
+		FROM workspace_members wm
+		JOIN users u ON u.id = wm.user_id
+		WHERE wm.workspace_id = ?
+		  AND (wm.role_sort, wm.sort_name, wm.sort_handle, wm.user_id) > (?, ?, ?, ?)
+		ORDER BY wm.role_sort, wm.sort_name, wm.sort_handle, wm.user_id
+		LIMIT ?`,
+		"wsp_plan", -1, "", "", "", 101,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var details []string
+	for rows.Next() {
+		var id, parent, notUsed int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+			t.Fatal(err)
+		}
+		details = append(details, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	plan := strings.Join(details, "\n")
+	if !strings.Contains(plan, "idx_workspace_members_page") {
+		t.Fatalf("expected member page index in query plan:\n%s", plan)
+	}
+	if strings.Contains(plan, "TEMP B-TREE") {
+		t.Fatalf("member page must not materialize a temporary sort:\n%s", plan)
+	}
+}
+
+func TestWorkspaceMemberSearchUsesUnicodeLowercaseKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	owner, err := st.CreateUser(ctx, store.CreateUserInput{
+		DisplayName: "Owner",
+		Email:       "unicode-members-owner@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultWorkspaceMember(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{
+		DisplayName: "Initial",
+		Email:       "unicode-member@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateUserProfile(ctx, store.UpdateUserProfileInput{
+		UserID:      member.ID,
+		DisplayName: "ÉLODIE",
+		Handle:      "agent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	inserted, err := st.CreateUser(ctx, store.CreateUserInput{
+		DisplayName: "ÅKE",
+		Email:       "unicode-inserted-member@example.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, inserted.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+
+	for query, expected := range map[string]string{"élodie": "ÉLODIE", "åke": "ÅKE"} {
+		page, err := st.ListWorkspaceMemberPage(
+			ctx,
+			workspace.ID,
+			owner.ID,
+			store.WorkspaceMemberPageRequest{Query: query},
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := memberNames(page.Members); len(got) != 1 || got[0] != expected {
+			t.Fatalf("expected Unicode-insensitive search for %q, got %#v", query, got)
+		}
+	}
+}
+
+func TestWorkspaceMemberPageMigrationsUpgradeExistingData(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st, err := Open("sqlite://" + t.TempDir() + "/clickclack.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	applySQLiteMigrationsBefore(t, ctx, st, "0019_workspace_member_page_indexes.sql")
+	mustExecSQL(t, ctx, st, `
+		INSERT INTO users (id, display_name, handle, created_at)
+		VALUES
+			('usr_owner', 'Owner', 'owner', ?),
+			('usr_unicode', 'ÉLODIE', 'ÉLODIE-HANDLE', ?)`,
+		now(), now(),
+	)
+	mustExecSQL(t, ctx, st, `
+		INSERT INTO workspaces (id, name, slug, created_at)
+		VALUES ('wsp_upgrade', 'Upgrade', 'upgrade', ?)`,
+		now(),
+	)
+	mustExecSQL(t, ctx, st, `
+		INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+		VALUES
+			('wsp_upgrade', 'usr_owner', 'owner', ?),
+			('wsp_upgrade', 'usr_unicode', 'member', ?)`,
+		now(), now(),
+	)
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var roleSort int
+	var sortName, sortHandle string
+	if err := st.db.QueryRowContext(ctx, `
+		SELECT role_sort, sort_name, sort_handle
+		FROM workspace_members
+		WHERE workspace_id = 'wsp_upgrade' AND user_id = 'usr_unicode'`,
+	).Scan(&roleSort, &sortName, &sortHandle); err != nil {
+		t.Fatal(err)
+	}
+	if roleSort != 2 || sortName != "élodie" || sortHandle != "élodie-handle" {
+		t.Fatalf("unexpected migrated sort keys: role=%d name=%q handle=%q", roleSort, sortName, sortHandle)
+	}
+	if got := scalarCount(t, ctx, st, `
+		SELECT COUNT(*)
+		FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_workspace_members_page'`,
+	); got != 1 {
+		t.Fatalf("expected workspace member page index, got %d", got)
+	}
+
+	page, err := st.ListWorkspaceMemberPage(ctx, "wsp_upgrade", "usr_owner", store.WorkspaceMemberPageRequest{
+		Query: "ÉLO",
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.TotalCount == nil || *page.TotalCount != 1 || len(page.Members) != 1 || page.Members[0].User.ID != "usr_unicode" {
+		t.Fatalf("unexpected migrated member page: %#v", page)
+	}
+}
+
+func TestAddWorkspaceMemberByActorEnforcesRolesAndInsertOutcome(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	owner, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Owner", Email: "member-add-owner@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultWorkspaceMember(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "member-add-moderator@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, moderator.ID, store.WorkspaceRoleModerator); err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "member-add-member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "member-add-guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	firstTarget, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "First Target", Email: "member-add-first@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondTarget, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Second Target", Email: "member-add-second@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, actor := range []store.User{member, guest} {
+		_, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+			WorkspaceID: workspace.ID,
+			UserID:      firstTarget.ID,
+			ActorUserID: actor.ID,
+			Role:        store.WorkspaceRoleMember,
+		})
+		if !errors.Is(err, store.ErrNotWorkspaceManager) {
+			t.Fatalf("expected %s to be denied, got %v", actor.DisplayName, err)
+		}
+	}
+	if _, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+		WorkspaceID: workspace.ID,
+		UserID:      firstTarget.ID,
+		ActorUserID: moderator.ID,
+		Role:        store.WorkspaceRoleModerator,
+	}); !errors.Is(err, store.ErrWorkspaceOwnerRequired) {
+		t.Fatalf("expected moderator assignment to require owner, got %v", err)
+	}
+	first, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+		WorkspaceID: workspace.ID,
+		UserID:      firstTarget.ID,
+		ActorUserID: owner.ID,
+		Role:        store.WorkspaceRoleModerator,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !first.Added || first.Role != store.WorkspaceRoleModerator {
+		t.Fatalf("unexpected first insert result: %#v", first)
+	}
+	replay, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+		WorkspaceID: workspace.ID,
+		UserID:      firstTarget.ID,
+		ActorUserID: owner.ID,
+		Role:        store.WorkspaceRoleMember,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.Added || replay.Role != store.WorkspaceRoleModerator {
+		t.Fatalf("idempotent add changed or misreported the role: %#v", replay)
+	}
+	second, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+		WorkspaceID: workspace.ID,
+		UserID:      secondTarget.ID,
+		ActorUserID: moderator.ID,
+		Role:        store.WorkspaceRoleMember,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Added || second.Role != store.WorkspaceRoleMember {
+		t.Fatalf("moderator could not add a member: %#v", second)
+	}
+	if _, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+		WorkspaceID: workspace.ID,
+		UserID:      secondTarget.ID,
+		ActorUserID: owner.ID,
+		Role:        store.WorkspaceRoleOwner,
+	}); err == nil {
+		t.Fatal("owner role was accepted outside the ownership-transfer flow")
+	}
+
+	if _, err := st.db.ExecContext(ctx, `DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?`, workspace.ID, firstTarget.ID); err != nil {
+		t.Fatal(err)
+	}
+	readded, err := st.AddWorkspaceMemberByActor(ctx, store.AddWorkspaceMemberInput{
+		WorkspaceID: workspace.ID,
+		UserID:      firstTarget.ID,
+		ActorUserID: owner.ID,
+		Role:        store.WorkspaceRoleMember,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !readded.Added || readded.Role != store.WorkspaceRoleMember {
+		t.Fatalf("re-add restored a stale privileged role: %#v", readded)
+	}
+}
+
+func memberNames(members []store.WorkspaceMember) []string {
+	names := make([]string, 0, len(members))
+	for _, member := range members {
+		names = append(names, member.User.DisplayName)
+	}
+	return names
+}

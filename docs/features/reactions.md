@@ -1,0 +1,68 @@
+---
+read_when:
+  - changing reaction add/remove or the reactions table
+---
+
+# Reactions
+
+Emoji reactions are a `(message_id, user_id, emoji)` triple. One reaction per
+user per emoji per message.
+
+## Message controls
+
+A mouse or trackpad reveals message actions on hover, including on touch-first
+tablets and embedded conversations. Touch input keeps the long-press action
+sheet. Switching between a trackpad and a finger updates those controls without
+reloading.
+
+Adding a reaction brings its chip into view immediately. Scrolling while the
+request is pending keeps the position you chose.
+
+## Endpoints
+
+```http
+POST   /api/messages/{message_id}/reactions
+DELETE /api/messages/{message_id}/reactions/{emoji}
+```
+
+`POST` body: `{"emoji":"👀"}`. Both endpoints require workspace membership for the
+message's workspace. Adding twice is a no-op that returns HTTP 200 without an
+event; removing a missing reaction is a no-op. Mutation responses include an
+event object and the message's complete aggregated reaction summaries. The
+event fields are empty on a no-op for compatibility with the existing mutation
+response shape.
+
+Message reads expose reactions as per-emoji summaries:
+
+```json
+{"emoji":"🦞","count":3,"reacted_by_me":true}
+```
+
+The API does not include the individual reacting users in message payloads.
+
+## Events
+
+- `reaction.added` on add
+- `reaction.removed` on remove
+
+The event payload contains `{message_id, emoji, user_id, count}` and inherits
+the message's `channel_seq`. `count` is the authoritative total for that emoji
+after the mutation, so realtime clients do not need to refetch the message.
+
+An event from another user establishes the count, but does not establish the
+viewer's own reaction flag. When an event arrives before a history page, the
+web client combines that newer count with the page's viewer flag unless an
+own-user event or a zero count has already established the flag. Authoritative
+reconnects discard cached reactions and hydrate roots and replies from each
+fresh snapshot page; ordinary pages preserve newer realtime state.
+
+## Storage
+
+Reactions are stored and compared as exact strings; there is no allowlist or
+shortcode conversion. Bots should send the same Unicode glyph as the web picker
+(for example, `👀`, `👍`, or `🦞`) to share its reaction count. `eyes`, `:eyes:`, and
+`👀` are three separate reactions, and custom strings render literally.
+
+To remove a reaction, URL-encode its exact string once as a path segment. For
+example, `%` becomes `%25`, `/` becomes `%2F`, and the literal string `%2F`
+becomes `%252F`. The SDK handles this encoding in `removeReaction`.

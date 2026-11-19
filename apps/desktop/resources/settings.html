@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ClickClack Desktop Settings</title>
+    <link rel="stylesheet" href="settings.css" />
+  </head>
+  <body>
+    <main class="settings-shell">
+      <header class="shell-header">
+        <div class="brand">
+          <img src="../assets/icon.png" alt="" width="30" height="30" />
+          <span class="brand-name">ClickClack</span>
+          <span class="brand-sep" aria-hidden="true"></span>
+          <span class="brand-context">Desktop settings</span>
+        </div>
+        <span class="platform-chip" id="platform-name">Desktop</span>
+      </header>
+
+      <form id="settings-form">
+        <section class="group" aria-labelledby="server-group-title">
+          <div class="group-head">
+            <h2 id="server-group-title">Server</h2>
+            <p>
+              Hosted ClickClack works out of the box. Self-hosted servers need HTTPS; loopback
+              HTTP is fine for local development.
+            </p>
+          </div>
+
+          <label class="field-label" for="server-url">Server address</label>
+          <div class="url-row">
+            <input
+              id="server-url"
+              name="server-url"
+              type="url"
+              autocomplete="url"
+              spellcheck="false"
+              placeholder="https://app.clickclack.chat"
+              required
+            />
+            <button id="test-server" type="button" class="key-button">Test</button>
+          </div>
+
+          <div class="status-rail" role="status">
+            <span class="status-light" aria-hidden="true"></span>
+            <span id="connection-status" data-state="idle">Loading settings…</span>
+          </div>
+        </section>
+
+        <section class="group" aria-labelledby="behavior-group-title">
+          <div class="group-head">
+            <h2 id="behavior-group-title">Desktop behavior</h2>
+          </div>
+
+          <div class="switch-stack">
+            <label class="switch-row">
+              <span>
+                <strong>Keep running in the tray</strong>
+                <small>Closing the window hides it; notifications and realtime stay live.</small>
+              </span>
+              <input id="close-to-tray" type="checkbox" />
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+
+            <label class="switch-row">
+              <span>
+                <strong>Launch at login</strong>
+                <small>Available with the native macOS and Windows installers.</small>
+              </span>
+              <input id="start-at-login" type="checkbox" />
+              <span class="switch" aria-hidden="true"></span>
+            </label>
+          </div>
+        </section>
+
+        <footer class="action-bar">
+          <span class="action-hint">Changes apply after reconnecting.</span>
+          <button id="save-settings" type="submit" class="key-button primary">
+            Save &amp; reconnect
+          </button>
+        </footer>
+      </form>
+
+      <p class="version-line" id="app-version">Desktop</p>
+    </main>
+    <script src="../dist/settings.js"></script>
+  </body>
+</html>

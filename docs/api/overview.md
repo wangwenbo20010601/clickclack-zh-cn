@@ -1,0 +1,89 @@
+---
+read_when:
+  - changing REST endpoints, websocket behavior, SDK methods, or OpenAPI
+  - adding integrations or bots
+---
+
+# API Overview
+
+`packages/protocol/openapi.yaml` is the API contract source of truth. Server
+handlers live in `apps/api/internal/httpapi`; the TypeScript SDK in
+`packages/sdk-ts` is the typed client.
+
+## Auth
+
+The server resolves callers in this order (see
+[../features/auth.md](../features/auth.md)):
+
+1. `Authorization: Bearer <token>` (session token, magic-link result).
+2. Session cookie (`cc_session` by default, or the configured namespaced name).
+3. `X-ClickClack-User: usr_...` header (local/dev impersonation for tests).
+4. Dev fallback to the first user in the DB (only with
+`--dev-bootstrap=true`).
+
+`/healthz`, `/readyz`, and the opt-in `/metrics` operator endpoint do not use
+chat authentication. `GET /api/home-link` is also public and returns the
+deployment's workspace home destination and label, with independent `/` and
+`cc` defaults; see [configuration](../configuration.md#workspace-home-link).
+Keep metrics private. Every HTTP response carries
+`X-Correlation-ID`; a caller-supplied value is accepted only when it uses the
+safe bounded character set. Durable `message.created` and
+`thread.reply_created` events copy that validated value to optional
+`payload.correlation_id` metadata for HTTP recovery and WebSocket consumers.
+The value is not stored on message rows or exported as a metrics label.
+
+## Endpoint groups
+
+| Group         | Endpoints | Doc |
+|---------------|-----------|-----|
+| Auth          | `/api/auth/magic/{request,consume}`, `/api/auth/github/{start,callback}` | [auth](../features/auth.md) |
+| Deployment navigation | `/api/home-link` (public) | [configuration](../configuration.md#workspace-home-link) |
+| Profile       | `/api/me`, `/api/me/bots` | [profiles](../features/profiles.md) |
+| Push devices  | `GET /api/me/push`, `PUT` and `DELETE /api/me/push/subscriptions` | [push notifications](../features/push-notifications.md) |
+| Workspaces    | `/api/workspaces`, `/api/workspaces/{id}`, `/api/workspaces/{id}/members` | [workspaces](../features/workspaces.md) |
+| Moderation    | `/api/workspaces/{id}/moderation/members` | [moderation](../features/moderation.md) |
+| Bots          | `/api/workspaces/{id}/{bots,bot-commands}`, `/api/workspaces/{id}/bots/{bot_id}/{tokens,membership,setup-codes}`, `/api/bots/{id}`, `/api/bots/{id}/tokens`, `/api/bots/self/commands`, `/api/bot-tokens/{id}/revoke`, `/api/bot-setup-codes/claim` | [bots](../features/bots.md) |
+| Event types   | `/api/event-types` | [integrations](../features/integrations.md) |
+| App installs  | `/api/workspaces/{id}/app-installations`, `/api/app-installations/{id}/revoke` | [integrations](../features/integrations.md) |
+| Slash commands | `/api/workspaces/{id}/slash-commands`, `/api/slash-commands/{id}/{revoke,rotate-secret}`, `/api/hooks/slash/{channel}` | [integrations](../features/integrations.md) |
+| Event subscriptions | `/api/workspaces/{id}/event-subscriptions`, `/api/event-subscriptions/{id}/{revoke,rotate-secret,deliveries}` | [integrations](../features/integrations.md) |
+| Audit log     | `/api/workspaces/{id}/audit-log` | [integrations](../features/integrations.md) |
+| Connected accounts | `/api/workspaces/{id}/connected-accounts`, `/api/connected-accounts/{id}/revoke` | [integrations](../features/integrations.md) |
+| Topics        | `/api/workspaces/{id}/topics` | [messages](../features/messages.md) |
+| Channels      | `/api/workspaces/{id}/channels`, `/api/channels/{id}` | [workspaces](../features/workspaces.md) |
+| Messages      | `/api/channels/{id}/messages`, `/api/messages/by-nonce`, `/api/messages/{id}` | [messages](../features/messages.md) |
+| Channel attention | `/api/channels/{id}/notification-settings` | [channel notifications](../features/channel-notifications.md) |
+| Pinned messages | `/api/channels/{id}/pins` | [pinned messages](../features/pinned-messages.md) |
+| Threads       | `/api/messages/{id}/thread`, `/api/messages/{id}/thread/replies` | [threads](../features/threads.md) |
+| Replies       | `quoted_message_id` on any message-create endpoint | [replies](../features/replies.md) |
+| Reactions     | `/api/messages/{id}/reactions` | [reactions](../features/reactions.md) |
+| Realtime      | `/api/realtime/{ws,events,ephemeral}` | [realtime](../features/realtime.md) |
+| Search        | `/api/search` | [search](../features/search.md) |
+| Uploads       | `/api/uploads`, `/api/uploads/by-nonce`, `/api/messages/{id}/attachments` | [uploads](../features/uploads.md) |
+| DMs           | `/api/dms`, `/api/dms/{id}`, `/api/dms/{id}/open`, `/api/dms/{id}/messages` | [dms](../features/dms.md) |
+| Integrations  | `/api/hooks/mattermost/{channel}` | [integrations](../features/integrations.md) |
+| Operations    | `/healthz`, `/readyz`, opt-in `/metrics` | [deployment](../deployment.md) |
+
+The standalone browser embeds live at
+`/embed/thread/{workspace_route_id}/{message_route_id}` and
+`/embed/channel/{workspace_route_id}/{channel_route_id}`. They resolve public
+route IDs through the normal route API and use the same authenticated channel,
+message, thread, and realtime endpoints listed above.
+
+## Conventions
+
+- All payloads are JSON unless explicitly multipart (uploads) or
+  form-encoded (slash commands).
+- Mutating endpoints return both the affected resource and the durable event
+  emitted (`{message, event}`), so clients can reconcile optimistically.
+- Pagination on listings uses cursor-style sequence numbers (`after_seq` for
+  channel/DM messages, `after_cursor` for events) or opaque cursors where the
+  ordering is not sequence-based (`cursor` for workspace members).
+- Errors come back as `{ "error": "<message>" }` with an HTTP status code.
+- Store-level moderation restrictions surface as `403`; exhausted guest post
+  budgets surface as `429`.
+
+## SDK
+
+TypeScript consumers should use `@clickclack/sdk-ts`. It depends on neither
+Svelte nor any HTTP framework. See [../sdk.md](../sdk.md).

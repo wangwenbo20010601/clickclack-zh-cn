@@ -1,0 +1,126 @@
+// Settings is split in two:
+//
+// 1. Account settings (Profile, Notifications) render inside a modal
+//    overlay (SettingsModal.svelte). These belong to the signed-in user
+//    and have no URL; opening one just toggles modal state.
+//
+// 2. Workspace settings (members, bots, integrations, etc.) live at the
+//    real route /app/{workspaceID}/settings and have their own shell.
+
+import type { Workspace } from "./types";
+
+export type AccountSettingsSectionId = "profile" | "appearance" | "notifications" | "bots";
+
+export type AccountSettingsSection = {
+  id: AccountSettingsSectionId;
+  label: string;
+};
+
+// Account modal sections (rendered in order in the rail).
+export const ACCOUNT_SETTINGS_SECTIONS: AccountSettingsSection[] = [
+  { id: "profile", label: "个人资料" },
+  { id: "appearance", label: "外观" },
+  { id: "notifications", label: "通知" },
+  { id: "bots", label: "我的机器人" },
+];
+
+export const DEFAULT_ACCOUNT_SETTINGS_SECTION: AccountSettingsSectionId = "profile";
+
+// Workspace settings sections. The `slug` is the URL segment under
+// /app/{workspaceID}/settings/. `group` controls which rail heading
+// the item lives under. `managersOnly` hides the item from the rail
+// when the current user is not an owner or moderator (the page itself
+// must still re-check via the backend; this is just a UI gate).
+export type WorkspaceSettingsSectionId = "overview" | "members" | "bots" | "integrations";
+
+export type WorkspaceSettingsGroupId = "workspace" | "people" | "automation";
+
+export type WorkspaceSettingsSection = {
+  id: WorkspaceSettingsSectionId;
+  slug: string;
+  label: string;
+  group: WorkspaceSettingsGroupId;
+  // Inline SVG path data strings for the rail icon (24×24 stroke icons).
+  icon: string[];
+  managersOnly?: boolean;
+};
+
+export const WORKSPACE_SETTINGS_GROUPS: { id: WorkspaceSettingsGroupId; label: string }[] = [
+  { id: "workspace", label: "工作区" },
+  { id: "people", label: "成员" },
+  { id: "automation", label: "自动化" },
+];
+
+export const WORKSPACE_SETTINGS_SECTIONS: WorkspaceSettingsSection[] = [
+  {
+    id: "overview",
+    slug: "overview",
+    label: "概览",
+    group: "workspace",
+    icon: [
+      "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z",
+      "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z",
+    ],
+  },
+  {
+    id: "members",
+    slug: "members",
+    label: "成员",
+    group: "people",
+    icon: [
+      "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2",
+      "M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z",
+      "M22 21v-2a4 4 0 0 0-3-3.87",
+      "M16 3.13a4 4 0 0 1 0 7.75",
+    ],
+  },
+  {
+    id: "bots",
+    slug: "bots",
+    label: "机器人与智能体",
+    group: "automation",
+    icon: [
+      "M12 8V4H8",
+      "M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z",
+      "M2 14h2",
+      "M20 14h2",
+      "M15 13v2",
+      "M9 13v2",
+    ],
+  },
+  {
+    id: "integrations",
+    slug: "integrations",
+    label: "集成",
+    group: "automation",
+    icon: ["M9 2v6", "M15 2v6", "M12 17v5", "M5 8h14l-1 7a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4L5 8Z"],
+  },
+];
+
+export const DEFAULT_WORKSPACE_SETTINGS_SECTION: WorkspaceSettingsSectionId = "overview";
+
+// Settings may be opened using either an internal workspace ID or a route ID.
+export function isSettingsWorkspaceCurrent(
+  workspace: Workspace,
+  currentWorkspaceID?: string | null,
+): boolean {
+  if (!currentWorkspaceID) return false;
+  return workspace.id === currentWorkspaceID || workspace.route_id === currentWorkspaceID;
+}
+
+// Falls back to the first workspace so the rail still names what it is showing
+// when the current workspace is unknown or is not in the list.
+export function defaultSettingsWorkspace(
+  workspaces: readonly Workspace[],
+  currentWorkspaceID?: string | null,
+): Workspace | null {
+  const current = workspaces.find((workspace) =>
+    isSettingsWorkspaceCurrent(workspace, currentWorkspaceID),
+  );
+  return current ?? workspaces[0] ?? null;
+}
+
+export function workspaceSettingsPath(workspaceID: string, slug?: string): string {
+  const base = `/app/${workspaceID}/settings`;
+  return slug ? `${base}/${slug}` : base;
+}

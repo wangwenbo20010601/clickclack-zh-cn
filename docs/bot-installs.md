@@ -1,0 +1,302 @@
+---
+title: Bot installs
+description: How to create ClickClack bot identities, mint scoped tokens, and install those tokens into runtimes such as OpenClaw.
+---
+
+# Bot installs
+
+A ClickClack bot install is three things:
+
+1. A `kind=bot` user inside one workspace.
+2. One scoped `ccb_...` bearer token for that bot.
+3. A runtime config that stores the token and knows which workspace/channel to
+   watch.
+
+The token is the install secret. The bot user is the visible chat identity.
+The runtime is whatever process uses the token: OpenClaw, CI, a small SDK
+script, or a service daemon.
+
+## Pick the bot shape
+
+Use a **service bot** for shared automation that does not belong to one human:
+deploy notifiers, triage agents, infrastructure bots, and shared OpenClaw
+workers.
+
+Use a **user-owned bot** when the bot should be visibly attached to a person:
+personal OpenClaw agents, delegated assistants, or automation that should lose
+access if the owner leaves the workspace.
+
+Both are normal ClickClack users with `kind=bot`. A service bot has no
+`owner_user_id`; a user-owned bot has `owner_user_id=<human user id>`. Bot
+tokens always authenticate as the bot user, never as the owner.
+
+## Service bots vs user-owned bots
+
+Service bots are workspace assets. A workspace owner or moderator creates them,
+rotates their tokens, revokes their tokens, and can remove them from the
+workspace.
+
+User-owned bots are personal automation identities. Only the human owner can
+create the bot and rotate or revoke its tokens, even if that owner is only a
+plain workspace member. Workspace owners and moderators can remove the bot from
+a workspace, but they do not gain token rotation or revocation rights.
+
+Any workspace member can inspect redacted token metadata such as the token name,
+scopes, creation time, last-use time, and revocation state. Raw token values are
+returned only once, when a token is created.
+
+Removing either bot shape from a workspace deletes that workspace membership
+and revokes that bot's tokens for that workspace. The bot user row stays so old
+messages keep rendering and a user-owned bot can be installed elsewhere later.
+
+## Create a service bot
+
+Run this on the ClickClack host, against the same data directory as the server:
+
+```sh
+clickclack admin bot create \
+  --data /var/lib/clickclack \
+  --workspace wsp_... \
+  --created-by usr_manager \
+  --name "OpenClaw Service" \
+  --handle openclaw-service \
+  --scopes bot:write \
+  --token-name openclaw-prod \
+  --plain
+```
+
+Docker deployment:
+
+```sh
+docker exec clickclack clickclack admin bot create \
+  --data /app/data \
+  --workspace wsp_... \
+  --created-by usr_manager \
+  --name "OpenClaw Service" \
+  --handle openclaw-service \
+  --scopes bot:write \
+  --token-name openclaw-prod \
+  --plain
+```
+
+`--plain` prints only the raw `ccb_...` token. Capture it once, move it into
+the target runtime secret store, and do not paste it into docs, tickets, chat,
+or logs.
+
+## Create a user-owned bot
+
+Pass the human owner's user ID:
+
+```sh
+clickclack admin bot create \
+  --data /var/lib/clickclack \
+  --workspace wsp_... \
+  --owner usr_peter \
+  --created-by usr_peter \
+  --name "Peter's OpenClaw" \
+  --handle peter-openclaw \
+  --scopes bot:write \
+  --token-name openclaw-personal \
+  --plain
+```
+
+The owner must be a human workspace member, and `--created-by` must match that
+owner. A bot cannot own another bot. The server also checks that the owner is
+still a workspace member when a user-owned bot token is used.
+
+## Scopes
+
+Start with the smallest useful bundle:
+
+- `bot:read`: read workspace/channel/message/thread/DM state and realtime
+  events.
+- `bot:write`: `bot:read` plus posting messages, replies, DMs, uploads, and
+  publishing the bot's command menu.
+- `bot:admin`: `bot:write` plus channel creation/update.
+
+Bundles are expanded to concrete scopes when the token is created. Existing
+tokens do not gain newly added bundle capabilities automatically; create a
+replacement token and revoke the old one after moving the runtime.
+
+Use explicit comma-separated scopes when a runtime needs less than a bundle:
+
+```sh
+--scopes workspaces:read,channels:read,messages:read,realtime:read
+```
+
+Current MVP scopes are documented in [features/bots.md](features/bots.md).
+
+## Install into OpenClaw
+
+The fastest path is the one-time setup command shown after creating an
+OpenClaw app or bot in the ClickClack web app:
+
+```sh
+openclaw channels add clickclack --code "https://app.clickclack.chat/#XXXX-XXXX-XXXX"
+```
+
+OpenClaw claims the short-lived code, receives the new bot token directly, and
+writes the account configuration selected in the ClickClack wizard, including
+the default channel, sender allowlist, and agent-activity setting. The token
+does not pass through the clipboard or shell history.
+
+Same-origin servers keep that command shape for compatibility. Split-origin
+or path-mounted servers issue the exact claim endpoint instead:
+
+```sh
+openclaw channels add clickclack \
+  --code "https://api.example.com/services/clickclack/api/bot-setup-codes/claim#XXXX-XXXX-XXXX"
+```
+
+The endpoint before `#` is server-issued and exact. Compatible OpenClaw
+consumers post the code there without appending a path, then persist the
+`api_base_url` returned by the claim.
+
+A running OpenClaw gateway picks up the new account automatically (the
+ClickClack extension hot-reloads on `channels.clickclack` changes). If the
+gateway is not running yet, start it with `openclaw gateway`.
+
+For manual token setup, use the fallback command shown beneath the raw token:
+
+```sh
+openclaw channels add clickclack \
+  --base-url https://app.clickclack.chat \
+  --token ccb_... \
+  --workspace clickclack
+```
+
+You can also run `openclaw onboard` for guided manual setup.
+
+For manual configuration, OpenClaw's ClickClack extension reads ClickClack
+accounts from `channels.clickclack`. Tokens may be plain strings or
+env-backed secret refs:
+
+```json5
+{
+  channels: {
+    clickclack: {
+      enabled: true,
+      baseUrl: "https://app.clickclack.chat",
+      token: { source: "env", provider: "default", id: "CLICKCLACK_BOT_TOKEN" },
+      workspace: "clickclack",
+      botUserId: "usr_...",
+      defaultTo: "channel:general",
+    },
+  },
+}
+```
+
+When using an env-backed ref, set the environment on the OpenClaw process:
+
+```sh
+export CLICKCLACK_BOT_TOKEN="ccb_..."
+openclaw gateway
+```
+
+For multiple bots in one OpenClaw install, add each bot as a named account
+(`openclaw channels add clickclack --account <name> …`) or use named
+accounts in config:
+
+```json5
+{
+  channels: {
+    clickclack: {
+      enabled: true,
+      baseUrl: "https://app.clickclack.chat",
+      defaultAccount: "service",
+      accounts: {
+        service: {
+          token: { source: "env", provider: "default", id: "CLICKCLACK_SERVICE_BOT_TOKEN" },
+          workspace: "clickclack",
+          botUserId: "usr_service",
+          defaultTo: "channel:general",
+        },
+        peter: {
+          token: { source: "env", provider: "default", id: "CLICKCLACK_PETER_BOT_TOKEN" },
+          workspace: "clickclack",
+          botUserId: "usr_peter",
+          defaultTo: "channel:general",
+        },
+      },
+    },
+  },
+}
+```
+
+```sh
+export CLICKCLACK_SERVICE_BOT_TOKEN="ccb_..."
+export CLICKCLACK_PETER_BOT_TOKEN="ccb_..."
+openclaw gateway
+```
+
+`workspace` may be the workspace ID (`wsp_...`) or slug. Targets are
+`channel:<name-or-id>`, `thread:<message-id>`, or `dm:<user-id>`.
+The default `replyMode` is `agent`. Using `replyMode: "model"` requires the
+explicit OpenClaw trust setting
+`plugins.entries.clickclack.llm.allowAgentIdOverride: true`.
+
+## Install into a small SDK bot
+
+For a one-shot bot:
+
+```sh
+CLICKCLACK_URL=https://app.clickclack.chat \
+CLICKCLACK_TOKEN=ccb_... \
+CLICKCLACK_CHANNEL_ID=chn_... \
+CLICKCLACK_TEXT="clack from bot" \
+pnpm --filter @clickclack/example-bot start
+```
+
+For a long-running bot, use `ClickClackBot` from the TypeScript SDK. Persist
+the latest event cursor after each handled event, reconnect with that cursor,
+and ignore messages authored by the bot's own `botUserId`.
+
+## Verify the install
+
+Check identity:
+
+```sh
+curl -fsS \
+  -H "Authorization: Bearer $CLICKCLACK_BOT_TOKEN" \
+  https://app.clickclack.chat/api/me
+```
+
+Check workspace access:
+
+```sh
+curl -fsS \
+  -H "Authorization: Bearer $CLICKCLACK_BOT_TOKEN" \
+  https://app.clickclack.chat/api/workspaces
+```
+
+Post a smoke message with the SDK example or the OpenClaw extension. In the UI,
+the message author should show the bot display name and a bot badge. A
+user-owned bot profile should also show that it belongs to its owner.
+
+## Rotate, remove, or delete
+
+Rotate by creating a new workspace-scoped token, moving the runtime to the new
+secret, then revoking the old token through
+`POST /api/bot-tokens/{token_id}/revoke`.
+
+Remove a bot from a workspace through
+`DELETE /api/workspaces/{workspace_id}/bots/{bot_user_id}/membership`. This
+revokes only that workspace's tokens for the bot. It does not delete the bot
+identity, so old messages keep rendering.
+
+Delete a bot everywhere through `DELETE /api/bots/{bot_user_id}` or the
+**Delete bot** action in workspace settings. Deletion revokes every credential
+and integration binding for that bot, preserves old messages under a deleted
+marker, and releases the former handle for a newly created bot ID. Deleting a
+shared service bot requires owner or moderator access in every affected
+workspace; already orphaned bots use their retained workspace history for this
+authorization check.
+
+Keep these rules:
+
+- Never commit raw `ccb_...` tokens.
+- Store production tokens in env files, 1Password, or the hosting provider's
+  secret store.
+- Use one token per runtime so rotation has a small blast radius.
+- Use service bots for shared infrastructure and user-owned bots for delegated
+  personal automation.

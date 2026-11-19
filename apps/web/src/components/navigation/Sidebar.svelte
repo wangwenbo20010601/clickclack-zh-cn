@@ -1,0 +1,290 @@
+<script lang="ts">
+  import { channelOrderStorageKey, parseChannelOrder, receiveChannelOrder, resolveChannelOrder, saveChannelOrder as persistChannelOrder } from "../../lib/channel-order";
+  import Avatar from "../avatar/Avatar.svelte";
+  import { api, apiResourceURL } from "../../lib/api";
+  import { avatarHue, directConversationForUser, handleLabel } from "../../lib/chat/people";
+  import type { Channel, DirectConversation, User } from "../../lib/types";
+  import ChannelList from "./ChannelList.svelte";
+  import DirectMessageList from "./DirectMessageList.svelte";
+
+  type Props = {
+    workspaceID: string;
+    workspaceName?: string;
+    workspaceIconURL?: string;
+    connected: boolean;
+    sidebarCollapsed: boolean;
+    showHeader?: boolean;
+    channels: Channel[];
+    directConversations: DirectConversation[];
+    recentPeople: User[];
+    currentUser: User | null;
+    selectedChannelID: string;
+    selectedDirectID: string;
+    selectedProfile: User | null;
+    onToggleCollapse: () => void;
+    hrefForChannel: (channelID: string) => string;
+    hrefForDirect: (conversationID: string) => string;
+    onSelectChannel: (channelID: string) => void;
+    onCreateChannel: () => void;
+    onSelectDirect: (conversationID: string) => void;
+    onCreateDirect: () => void;
+    onHideDirect: (conversationID: string) => void;
+    hiddenDirectTitle?: string;
+    onUndoHideDirect: () => void;
+    onOpenProfile: (profile: User) => void;
+    onOpenSettings: () => void;
+    onOpenWorkspaceSettings: () => void;
+  };
+
+  let {
+    workspaceID,
+    workspaceName,
+    workspaceIconURL,
+    connected,
+    sidebarCollapsed,
+    showHeader = true,
+    channels,
+    directConversations,
+    recentPeople,
+    currentUser,
+    selectedChannelID,
+    selectedDirectID,
+    selectedProfile,
+    onToggleCollapse,
+    hrefForChannel,
+    hrefForDirect,
+    onSelectChannel,
+    onCreateChannel,
+    onSelectDirect,
+    onCreateDirect,
+    onHideDirect,
+    hiddenDirectTitle,
+    onUndoHideDirect,
+    onOpenProfile,
+    onOpenSettings,
+    onOpenWorkspaceSettings,
+  }: Props = $props();
+
+  type SectionState = { channels: boolean; directMessages: boolean; people: boolean };
+  const SECTION_STORAGE_PREFIX = "clickclack:sidebar-sections:v1:";
+  const DEFAULT_SECTION_STATE: SectionState = { channels: true, directMessages: true, people: true };
+  let sections = $state<SectionState>({ ...DEFAULT_SECTION_STATE });
+
+  function isSectionState(value: unknown): value is SectionState {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as Record<string, unknown>;
+    return typeof candidate.channels === "boolean" && typeof candidate.directMessages === "boolean" && typeof candidate.people === "boolean";
+  }
+
+  function loadSections(id: string): SectionState {
+    if (!id) return { ...DEFAULT_SECTION_STATE };
+    try {
+      const raw = window.localStorage.getItem(`${SECTION_STORAGE_PREFIX}${id}`);
+      if (!raw) return { ...DEFAULT_SECTION_STATE };
+      const parsed: unknown = JSON.parse(raw);
+      return isSectionState(parsed) ? parsed : { ...DEFAULT_SECTION_STATE };
+    } catch {
+      return { ...DEFAULT_SECTION_STATE };
+    }
+  }
+
+  function toggleSection(section: keyof SectionState) {
+    sections = { ...sections, [section]: !sections[section] };
+    if (!workspaceID) return;
+    try {
+      window.localStorage.setItem(`${SECTION_STORAGE_PREFIX}${workspaceID}`, JSON.stringify(sections));
+    } catch {
+      // Storage is an enhancement; disclosures still work when it is unavailable.
+    }
+  }
+
+  $effect(() => {
+    sections = loadSections(workspaceID);
+  });
+
+  let channelOrder = $state<string[]>([]);
+
+  function saveChannelOrder(order: string[]) {
+    channelOrder = order;
+    const userID = currentUser?.id;
+    if (!workspaceID || !userID) return;
+    void persistChannelOrder(userID, workspaceID, order, api, () => currentUser?.id === userID);
+  }
+
+  function handleStorage(event: StorageEvent) {
+    if (!currentUser?.id) return;
+    receiveChannelOrder(event.key, event.newValue, currentUser.id);
+    if (event.key === channelOrderStorageKey(workspaceID, currentUser.id)) {
+      channelOrder = parseChannelOrder(event.newValue);
+    }
+  }
+
+  let orderedChannels = $derived.by(() => {
+    const byID = new Map(channels.map((channel) => [channel.id, channel]));
+    const saved = channelOrder.flatMap((id) => {
+      const channel = byID.get(id);
+      if (!channel) return [];
+      byID.delete(id);
+      return [channel];
+    });
+    return [...saved, ...byID.values()];
+  });
+
+  $effect(() => {
+    channelOrder = resolveChannelOrder(currentUser, workspaceID);
+  });
+
+  function shouldHandleClientNavigation(event: MouseEvent): boolean {
+    return event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+  }
+</script>
+
+<svelte:window onstorage={handleStorage} />
+
+<aside class="sidebar" aria-label="频道与私聊">
+  {#if showHeader}
+  <header class="workspace-header">
+    <button
+      type="button"
+      class="workspace-menu"
+      aria-label="工作区设置"
+      title="工作区设置"
+      onclick={onOpenWorkspaceSettings}
+    >
+      {#if workspaceIconURL}
+        <img class="workspace-header-icon" src={apiResourceURL(workspaceIconURL)} alt="" />
+      {/if}
+      <span class="workspace-name">
+        <strong>
+          <span class="workspace-name-label">{workspaceName || "选择工作区"}</span>
+          <svg class="workspace-menu-caret" viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">
+            <path d="m6 9 6 6 6-6" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" />
+          </svg>
+        </strong>
+        {#if !connected}
+          <span class="presence">正在连接…</span>
+        {/if}
+      </span>
+    </button>
+    <div class="workspace-header-actions">
+      <button
+        type="button"
+        class="sidebar-collapse"
+        aria-label={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+        title={sidebarCollapsed ? "展开侧边栏" : "收起侧边栏"}
+        onclick={onToggleCollapse}
+      >
+        <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+          <path
+            fill="none"
+            stroke="currentColor"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d={sidebarCollapsed ? "m9 6 6 6-6 6" : "m15 6-6 6 6 6"}
+          />
+        </svg>
+      </button>
+    </div>
+  </header>
+  {/if}
+
+  <div class="sidebar-scroll">
+    <ChannelList
+      {workspaceID}
+      expanded={sections.channels}
+      channels={orderedChannels}
+      {selectedChannelID}
+      {selectedDirectID}
+      {hrefForChannel}
+      {onSelectChannel}
+      {onCreateChannel}
+      onToggle={() => toggleSection("channels")}
+      onReorder={saveChannelOrder}
+    />
+
+    <DirectMessageList
+      expanded={sections.directMessages}
+      conversations={directConversations}
+      currentUserID={currentUser?.id}
+      {selectedDirectID}
+      {hrefForDirect}
+      {onSelectDirect}
+      {onCreateDirect}
+      {onHideDirect}
+      {hiddenDirectTitle}
+      {onUndoHideDirect}
+      onToggle={() => toggleSection("directMessages")}
+    />
+
+    <section class="nav-section" class:collapsed={!sections.people}>
+      <div class="section-title">
+        <button type="button" class="section-toggle" aria-expanded={sections.people} aria-controls="sidebar-people-list" onclick={() => toggleSection("people")}>
+          <span class="caret" aria-hidden="true">▾</span>
+          <span class="label">成员</span>
+        </button>
+      </div>
+      <div class="nav-list" id="sidebar-people-list" hidden={!sections.people}>
+        {#each recentPeople as person (person.id)}
+          {@const conversation = directConversationForUser(directConversations, person.id, currentUser?.id)}
+          <a
+            href={conversation ? hrefForDirect(conversation.id) : "#"}
+            class="nav-item dm"
+            class:active={conversation?.id === selectedDirectID || selectedProfile?.id === person.id}
+            onclick={(event) => {
+              if (conversation) {
+                if (!shouldHandleClientNavigation(event)) return;
+                event.preventDefault();
+                onSelectDirect(conversation.id);
+              } else {
+                event.preventDefault();
+                onOpenProfile(person);
+              }
+            }}
+          >
+            <Avatar
+              class="dm-avatar"
+              id={person.id}
+              name={person.display_name}
+              src={person.avatar_url}
+              size={22}
+            />
+            <span class="nav-label">{person.display_name}</span>
+            <span class="presence-dot active" aria-hidden="true"></span>
+          </a>
+        {/each}
+        {#if recentPeople.length === 0}
+          <p class="nav-empty">与你聊天的成员会显示在这里</p>
+        {/if}
+      </div>
+    </section>
+  </div>
+
+  {#if currentUser}
+    <button
+      class="user-card"
+      type="button"
+      onclick={onOpenSettings}
+      oncontextmenu={(event) => {
+        event.preventDefault();
+        onOpenSettings();
+      }}
+      aria-label={`${currentUser.display_name} ${handleLabel(currentUser.handle)} 的账户设置`}
+    >
+      <Avatar
+        class="dm-avatar"
+        id={currentUser.id}
+        name={currentUser.display_name}
+        src={currentUser.avatar_url}
+        size={28}
+        loading="eager"
+        fetchPriority="auto"
+      />
+      <div class="user-meta">
+        <strong>{currentUser.display_name}</strong>
+        <span>{currentUser.handle ? handleLabel(currentUser.handle) : connected ? "在线" : "正在重新连接…"}</span>
+      </div>
+      <span class="presence-dot active" aria-hidden="true"></span>
+    </button>
+  {/if}
+</aside>

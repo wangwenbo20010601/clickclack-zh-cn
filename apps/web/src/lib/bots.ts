@@ -1,0 +1,465 @@
+import { api, apiBaseURL, APIError } from "./api";
+import type { User, Workspace } from "./types";
+
+export type BotToken = {
+  id: string;
+  bot_user_id: string;
+  workspace_id: string;
+  owner_user_id?: string;
+  name: string;
+  scopes: string[];
+  created_by?: string;
+  created_at: string;
+  last_used_at?: string;
+  revoked_at?: string;
+  token?: string;
+};
+
+export type BotWithTokens = {
+  bot: User;
+  tokens: BotToken[];
+};
+
+export type DeletedBot = {
+  id: string;
+  display_name: string;
+  former_handle: string;
+  deleted_at: string;
+};
+
+export type OwnedBotWorkspace = {
+  id: string;
+  route_id: string;
+  name: string;
+};
+
+export type OwnedBotEntry = {
+  bot: User;
+  workspace: OwnedBotWorkspace;
+  active_token_count: number;
+};
+
+export type BotScopeBundle = "bot:read" | "bot:write" | "bot:admin";
+
+export const BOT_SCOPE_BUNDLES: { id: BotScopeBundle; label: string; hint: string }[] = [
+  {
+    id: "bot:read",
+    label: "只读",
+    hint: "查看频道、消息和话题，无写入权限。",
+  },
+  {
+    id: "bot:write",
+    label: "读写",
+    hint: "发送和编辑消息、发起私聊、上传附件及发布命令菜单。",
+  },
+  {
+    id: "bot:admin",
+    label: "管理",
+    hint: "读写消息、发布命令菜单及管理频道。请谨慎授予此权限。",
+  },
+];
+
+// Mirrors botScopeBundles in apps/api/internal/store/sqlite/bots.go. The server
+// expands bundles into individual scopes at mint time, so the UI reverse-matches
+// stored scope lists back to bundle labels for compact display.
+const BOT_SCOPE_BUNDLE_EXPANSIONS: Record<BotScopeBundle, readonly string[]> = {
+  "bot:read": [
+    "workspaces:read",
+    "channels:read",
+    "messages:read",
+    "threads:read",
+    "dms:read",
+    "realtime:read",
+    "profile:read",
+  ],
+  "bot:write": [
+    "workspaces:read",
+    "channels:read",
+    "messages:read",
+    "messages:write",
+    "threads:read",
+    "threads:write",
+    "dms:read",
+    "dms:write",
+    "realtime:read",
+    "uploads:write",
+    "profile:read",
+    "commands:write",
+  ],
+  "bot:admin": [
+    "workspaces:read",
+    "channels:read",
+    "channels:write",
+    "messages:read",
+    "messages:write",
+    "threads:read",
+    "threads:write",
+    "dms:read",
+    "dms:write",
+    "realtime:read",
+    "uploads:write",
+    "profile:read",
+    "commands:write",
+  ],
+};
+
+export type BotScopeSummary = {
+  bundle: BotScopeBundle | null;
+  bundleLabel: string | null;
+  extras: string[];
+};
+
+// Collapses a scope list to the largest bundle it covers plus any leftover
+// scopes. Accepts both server-expanded lists and raw bundle ids. Returns
+// bundle:null when no bundle matches (custom sets render as raw chips).
+export function summarizeBotScopes(scopes: string[]): BotScopeSummary {
+  const have = new Set<string>();
+  for (const scope of scopes) {
+    have.add(scope);
+    const expansion = BOT_SCOPE_BUNDLE_EXPANSIONS[scope as BotScopeBundle];
+    if (expansion) for (const s of expansion) have.add(s);
+  }
+  for (const id of ["bot:admin", "bot:write", "bot:read"] as const) {
+    const expansion = BOT_SCOPE_BUNDLE_EXPANSIONS[id];
+    if (!expansion.every((scope) => have.has(scope))) continue;
+    const covered = new Set<string>(expansion);
+    return {
+      bundle: id,
+      bundleLabel: BOT_SCOPE_BUNDLES.find((b) => b.id === id)?.label ?? id,
+      extras: scopes.filter((scope) => {
+        if (scope === id) return false;
+        const nested = BOT_SCOPE_BUNDLE_EXPANSIONS[scope as BotScopeBundle];
+        if (nested) return !nested.every((s) => covered.has(s));
+        return !covered.has(scope);
+      }),
+    };
+  }
+  return { bundle: null, bundleLabel: null, extras: scopes };
+}
+
+// Expands bundle shorthand into the concrete scopes the server grants.
+// Views that promise the full permission list must use this so bundle ids
+// never hide the individual permissions they carry.
+export function expandBotScopes(scopes: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const scope of scopes) {
+    const expansion = BOT_SCOPE_BUNDLE_EXPANSIONS[scope as BotScopeBundle];
+    for (const s of expansion ?? [scope]) {
+      if (!seen.has(s)) {
+        seen.add(s);
+        out.push(s);
+      }
+    }
+  }
+  return out;
+}
+
+export type CreateBotInput = {
+  display_name: string;
+  handle?: string;
+  avatar_url?: string;
+  owner_user_id?: string;
+  token_name?: string;
+  scopes?: string[];
+  setup_nonce?: string;
+  // false skips the initial token mint (setup-code installs mint the
+  // token at claim time instead).
+  initial_token?: boolean;
+};
+
+export type CreateBotResponse = {
+  bot: User;
+  // Omitted when the bot was created with initial_token: false.
+  bot_token?: BotToken;
+};
+
+export type BotSetupCode = {
+  id: string;
+  bot_user_id: string;
+  workspace_id: string;
+  token_name: string;
+  scopes: string[];
+  defaults: BotSetupCodeDefaults;
+  created_by?: string;
+  created_at: string;
+  expires_at: string;
+  // One-time plaintext code (XXXX-XXXX-XXXX). Present only in the mint
+  // response; the server stores just a hash.
+  code?: string;
+  contract_version?: 1;
+  claim_url?: string;
+  api_base_url?: string;
+};
+
+export type BotSetupCodeDefaults = {
+  defaultTo?: string;
+  allowFrom?: string[];
+  agentActivity?: boolean;
+};
+
+export async function listWorkspaceBots(workspaceID: string): Promise<BotWithTokens[]> {
+  const data = await api<{ bots: BotWithTokens[] }>(`/api/workspaces/${workspaceID}/bots`);
+  return data.bots ?? [];
+}
+
+export async function createWorkspaceBot(
+  workspaceID: string,
+  input: CreateBotInput,
+): Promise<CreateBotResponse> {
+  return api<CreateBotResponse>(`/api/workspaces/${workspaceID}/bots`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function listWorkspaceBotTokens(
+  workspaceID: string,
+  botUserID: string,
+): Promise<BotToken[]> {
+  const data = await api<{ bot_tokens: BotToken[] }>(
+    `/api/workspaces/${workspaceID}/bots/${botUserID}/tokens`,
+  );
+  return data.bot_tokens ?? [];
+}
+
+export async function createWorkspaceBotToken(
+  workspaceID: string,
+  botUserID: string,
+  input: { name?: string; scopes?: string[]; setup_nonce?: string },
+): Promise<BotToken> {
+  const data = await api<{ bot_token: BotToken }>(
+    `/api/workspaces/${workspaceID}/bots/${botUserID}/tokens`,
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  );
+  return data.bot_token;
+}
+
+export async function createWorkspaceBotSetupCode(
+  workspaceID: string,
+  botUserID: string,
+  input: { name?: string; scopes?: string[]; defaults?: BotSetupCodeDefaults },
+): Promise<BotSetupCode> {
+  const data = await api<{ setup_code: BotSetupCode }>(
+    `/api/workspaces/${workspaceID}/bots/${botUserID}/setup-codes`,
+    {
+      method: "POST",
+      body: JSON.stringify(input),
+    },
+  );
+  return data.setup_code;
+}
+
+export async function listBotTokens(botUserID: string): Promise<BotToken[]> {
+  const data = await api<{ bot_tokens: BotToken[] }>(`/api/bots/${botUserID}/tokens`);
+  return data.bot_tokens ?? [];
+}
+
+export async function createBotToken(
+  botUserID: string,
+  input: { name?: string; scopes?: string[]; setup_nonce?: string },
+): Promise<BotToken> {
+  const data = await api<{ bot_token: BotToken }>(`/api/bots/${botUserID}/tokens`, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  return data.bot_token;
+}
+
+export async function revokeBotToken(tokenID: string): Promise<BotToken> {
+  const data = await api<{ bot_token: BotToken }>(`/api/bot-tokens/${tokenID}/revoke`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  return data.bot_token;
+}
+
+export async function removeBotFromWorkspace(
+  workspaceID: string,
+  botUserID: string,
+): Promise<void> {
+  await api(`/api/workspaces/${workspaceID}/bots/${botUserID}/membership`, {
+    method: "DELETE",
+  });
+}
+
+export async function deleteBot(botUserID: string): Promise<DeletedBot> {
+  const data = await api<{ deleted_bot: DeletedBot }>(`/api/bots/${botUserID}`, {
+    method: "DELETE",
+  });
+  return data.deleted_bot;
+}
+
+export async function listMyBots(): Promise<OwnedBotEntry[]> {
+  const data = await api<{ bots: OwnedBotEntry[] }>("/api/me/bots");
+  return data.bots ?? [];
+}
+
+export function botLoadErrorMessage(err: unknown): string {
+  if (err instanceof APIError) {
+    if (err.status === 401) return "请登录后管理机器人。";
+    if (err.status === 403) return "你没有权限管理此工作区中的机器人。";
+    if (err.status === 404) return "该机器人或工作区已不可用。";
+    if (err.status === 409) return "该用户名已被占用，请更换一个。";
+    if (err.status === 400) return err.message || "请求无效。";
+  }
+  return err instanceof Error ? err.message : "出现错误";
+}
+
+export function isServiceBot(bot: { owner_user_id?: string }): boolean {
+  return !bot.owner_user_id;
+}
+
+export function activeTokens(tokens: BotToken[] | undefined): BotToken[] {
+  if (!tokens) return [];
+  return tokens.filter((t) => !t.revoked_at);
+}
+
+export function suggestHandleFrom(displayName: string): string {
+  return displayName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+}
+
+export type OpenClawAccountMode = "single" | "named";
+
+export function openClawWorkspaceIdentifier(workspace: Pick<Workspace, "id" | "slug">): string {
+  return workspace.slug.trim() || workspace.id;
+}
+
+function jsonString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function envNameForHandle(handle: string): string {
+  const suffix = handle
+    .replace(/^@/, "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  return suffix ? `CLICKCLACK_${suffix}_BOT_TOKEN` : "CLICKCLACK_BOT_TOKEN";
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function buildOpenClawConfigSnippet(opts: {
+  workspace: string;
+  botHandle: string;
+  botUserID: string;
+  mode: OpenClawAccountMode;
+  baseURL?: string;
+  defaultTo?: string;
+  allowFrom?: string[];
+  agentActivity?: boolean;
+}): string {
+  const base = (
+    opts.baseURL ||
+    apiBaseURL() ||
+    (typeof window !== "undefined" ? window.location.origin : "")
+  ).replace(/\/$/, "");
+  const handle = opts.botHandle.replace(/^@/, "");
+  const envName = opts.mode === "single" ? "CLICKCLACK_BOT_TOKEN" : envNameForHandle(handle);
+  const baseURL = base || "https://your-clickclack.example.com";
+  const defaultTo = opts.defaultTo?.trim() || "channel:general";
+
+  // Account-level lines shared by both single and named-account shapes.
+  const accountLines = (indent: string): string => {
+    const lines = [
+      `workspace: ${jsonString(opts.workspace)},`,
+      `botUserId: ${jsonString(opts.botUserID)},`,
+      `defaultTo: ${jsonString(defaultTo)},`,
+    ];
+    if (opts.allowFrom && opts.allowFrom.length > 0 && !opts.allowFrom.includes("*")) {
+      lines.push(`allowFrom: [${opts.allowFrom.map(jsonString).join(", ")}],`);
+    }
+    if (opts.agentActivity) {
+      lines.push(`agentActivity: true,`);
+    }
+    return lines.map((line) => indent + line).join("\n");
+  };
+
+  if (opts.mode === "named") {
+    return `{
+  channels: {
+    clickclack: {
+      enabled: true,
+      baseUrl: ${jsonString(baseURL)},
+      defaultAccount: ${jsonString(handle)},
+      accounts: {
+        ${jsonString(handle)}: {
+          token: { source: "env", provider: "default", id: ${jsonString(envName)} },
+${accountLines("          ")}
+        },
+      },
+    },
+  },
+}`;
+  }
+
+  return `{
+  channels: {
+    clickclack: {
+      enabled: true,
+      baseUrl: ${jsonString(baseURL)},
+      token: { source: "env", provider: "default", id: ${jsonString(envName)} },
+${accountLines("      ")}
+    },
+  },
+}`;
+}
+
+export function buildOpenClawCodeSnippet(opts: {
+  code: string;
+  botHandle: string;
+  mode: OpenClawAccountMode;
+  baseURL?: string;
+  claimURL?: string;
+  apiBaseURL?: string;
+  frontendURL?: string;
+}): string {
+  const browserOrigin =
+    opts.frontendURL || (typeof window !== "undefined" ? window.location.origin : "");
+  const issuedAPIBase = (opts.apiBaseURL || apiBaseURL()).replace(/\/$/, "");
+  const base = (opts.baseURL || issuedAPIBase || browserOrigin).replace(/\/$/, "");
+  const exactClaimURL = (opts.claimURL || "").replace(/\/$/, "");
+  const endpoint =
+    exactClaimURL && issuedAPIBase && issuedAPIBase !== browserOrigin
+      ? exactClaimURL
+      : base || "https://your-clickclack.example.com/";
+  const handle = opts.botHandle.replace(/^@/, "");
+  const accountArg = opts.mode === "named" ? ` --account ${shellQuote(handle)}` : "";
+  const separator = endpoint.endsWith("/") ? "#" : "/#";
+  const setupURI =
+    exactClaimURL && endpoint === exactClaimURL
+      ? `${endpoint}#${opts.code}`
+      : `${endpoint}${separator}${opts.code}`;
+  return `openclaw channels add clickclack${accountArg} --code ${shellQuote(setupURI)}`;
+}
+
+export function buildOpenClawShellSnippet(opts: {
+  botHandle: string;
+  token: string;
+  mode: OpenClawAccountMode;
+  workspace: string;
+  baseURL?: string;
+}): string {
+  const base =
+    (
+      opts.baseURL ||
+      apiBaseURL() ||
+      (typeof window !== "undefined" ? window.location.origin : "")
+    ).replace(/\/$/, "") || "https://your-clickclack.example.com";
+  const handle = opts.botHandle.replace(/^@/, "");
+  const accountLine = opts.mode === "named" ? ` \\\n  --account ${shellQuote(handle)}` : "";
+  return `openclaw channels add clickclack${accountLine} \\
+  --base-url ${shellQuote(base)} \\
+  --token ${shellQuote(opts.token)} \\
+  --workspace ${shellQuote(opts.workspace)}`;
+}

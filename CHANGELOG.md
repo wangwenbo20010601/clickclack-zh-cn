@@ -1,0 +1,464 @@
+# Changelog
+
+## Unreleased
+
+## 0.9.5 - 2026-11-15
+
+**Highlights:** Reliable navigation from notifications, clearer archived-channel and CLI behavior, and a security fix for the HTTP/1 header race.
+
+- Open the notified channel or thread even when an existing app window misses the notification click, while retaining in-page navigation for responsive windows. Thanks @chmac.
+- Reject new posts and thread replies to archived channels with a clear HTTP 409 error, and document restoring a channel without changing its ID. Thanks @tre1d.
+- List the commands in `clickclack help`, `-h`, and `--help` instead of only the client flags; `clickclack help` no longer fails with `unknown command "help"`. Thanks @KrasimirKralev.
+- Workspace settings now say to type the workspace name before deleting it, label that field for screen readers, and show "No eligible members" instead of a blank transfer menu. Thanks @KrasimirKralev.
+- Build with Go 1.27.4 to fix the reachable HTTP/1 header race (GO-2026-6859), retaining the Go 1.26.6 module minimum.
+- Refresh eligible web, desktop, development, and Go dependencies, retaining the 48-hour cooldown, runtime minimums, security overrides, and the matching SQLite/libc pair; pin Virtua 0.54.0 to preserve scroll restoration.
+
+## 0.9.4 - 2026-11-05
+
+**Highlights:** Clearer client configuration and signed-out session errors, with refreshed desktop and database dependencies.
+
+- Warn on stderr when the stored client config cannot be read or parsed, naming the file, instead of silently falling back to `http://localhost:8080` with no token. Thanks @KrasimirKralev.
+- Answer an API call with a signed-out or unknown session token with "session not found or signed out; sign in again" instead of the database's `sql: no rows in result set`. Thanks @KrasimirKralev.
+- Refresh eligible web, desktop, and development dependencies, including Electron 43.8.6, pgx 5.12.0, and SQLite 1.61.1, while preserving the 48-hour cooldown, runtime floors, and paired SQLite libc.
+- Correct the CLI docs: stored client config lives in the OS user config directory (`$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support` on macOS, `%AppData%` on Windows), not always `~/.config`. Thanks @KrasimirKralev.
+- Batch main CodeQL analysis weekly while preserving PR and manual scans.
+
+## 0.9.3 - 2026-10-26
+
+**Highlights:** Cancelled search navigation keeps threads closed, with security fixes for certificate validation and web and desktop dependencies.
+
+- Keep a thread closed when Escape cancels a search-result navigation before its URL has committed.
+- Reject compromised certificate authority keys in the local Worker runtime by pinning patched workerd. Thanks @joshavant.
+- Patch SvelteKit, URI parsing, brace expansion, HTTP cache parsing, and HTTP client vulnerabilities in web tooling and desktop packaging dependencies.
+- Update SQLite and its paired libc runtime, virtual scrolling, desktop packaging, and Wrangler while preserving runtime minimums and the 48-hour dependency release-age gate; align the development guide with the pinned pnpm version.
+- Correct the agent-friendly CLI docs: the message body comes from `--body`, then `--file`, then `--stdin`, and the positional argument is used only when none of them is given. Thanks @KrasimirKralev.
+
+## 0.9.2 - 2026-10-23
+
+**Highlights:** Reject compromised certificate authority keys in the desktop runtime and refresh bundled runtimes.
+
+- Reject compromised certificate authority keys in the desktop runtime. Thanks @joshavant.
+- Update Node.js and pnpm runtimes and refresh Alpine certificate bundles in container images. Thanks @joshavant.
+- Update Electron 43, Vite, and Oxc tooling while preserving runtime minimums and the 48-hour dependency release-age gate.
+- Correct the install and deployment docs: signed macOS server archives are built separately from GoReleaser and use `ClickClack-<version>-mac-server-SHA256SUMS.txt`. Thanks @KrasimirKralev.
+
+## 0.9.1 - 2026-10-20
+
+**Highlights:** Safer certificate verification and CLI logout, with reliable thread commands and readable compact timestamps.
+
+- Build with Go 1.27.3 to reject compromised intermediate certificates and fix reachable GO-2026-6809, retaining the Go 1.26.6 module minimum.
+- Revoke the stored CLI session before removing local credentials on logout, preserving credentials for retry when the server is unavailable. Thanks @KrasimirKralev.
+- Accept client flags before the message ID in CLI `threads open`, `threads reply`, and `reply`, which previously sent the flag as the message ID and failed. Thanks @KrasimirKralev.
+- Keep localized hover timestamps outside compact outlined message bubbles, and stabilize browser layout checks across appearance settings.
+- Align SQLite with its required libc runtime and update Playwright, Wrangler, Electron 43, and Chi while preserving runtime minimums and the 48-hour dependency release-age gate.
+- Move macOS desktop CI and release verification to macOS 27, run Intel server checks with Rosetta, and verify signed macOS assets during release dry runs while preserving deployment minimums.
+
+## 0.9.0 - 2026-10-18
+
+**Highlights:** Windows desktop downloads now carry verified OpenClaw Foundation signatures.
+
+- Require valid, timestamped OpenClaw Foundation Authenticode signatures on official Windows installers, applications, and uninstallers, and verify finished NSIS/ZIP packages before publication. Thanks @vincentkoc.
+- Build official releases only from immutable fleet-signed tags in reviewed main history, with source revalidation at every build boundary.
+
+## 0.8.0 - 2026-10-16
+
+**Highlights:** Fix ten reachable Go vulnerabilities, refresh chat dependencies, and add a read-only release dry run.
+
+- Fix ten reachable Go standard-library vulnerabilities by using the patched build toolchain and checking reachable vulnerabilities in CI.
+- Update rendering, scrolling, Electron 43, Go 1.27.2, and development dependencies while preserving runtime minimums and the 48-hour dependency release-age gate.
+- Add a read-only release dry run that checks the current main commit and builds snapshots without signing or publishing artifacts.
+
+## 0.7.1 - 2026-10-11
+
+**Highlights:** Quieter idle chats, reachable sidebar controls, and more reliable alerts and sign-in.
+
+- Stop hidden typing indicators from animating so idle channels and DMs avoid continuous redraws. Thanks @isaiahknight-va.
+- Limit the unread bar’s dot to three pulses, keeping the unread cue visible without continuous repainting. Thanks @isaiahknight-va.
+- Keep sidebar creation and collapse controls reachable with long workspace or account names by constraining the grid column. Thanks @isaiahknight-va and @NOLXII for the report.
+- Prevent a slow browser push endpoint from occupying every delivery worker, while keeping one shared limit of 1,024 pending alerts and normal success bookkeeping. Thanks @SebTardif.
+- Keep startup available during default OpenClaw ID discovery server errors while custom issuers still fail closed. Thanks @SebTardif.
+- Update Svelte, Markdown rendering, virtual scrolling, Vite, Electron 43, Playwright, and Go and development dependencies while preserving runtime minimums and the 48-hour dependency release-age gate.
+- Update SQLite, PDF.js, virtual scrolling, Vite, Electron 43, Wrangler, and Node.js types while preserving runtime minimums and the 48-hour dependency release-age gate.
+
+## 0.7.0 - 2026-09-30
+
+**Highlights:** Personal channel order follows your account across browsers and devices.
+
+- Personal sidebar channel order now follows your account across browsers and devices, with the existing local cache retained for offline use. Thanks @isaiahknight-va.
+- Preserve saved sidebar channel order, including explicit clears, in SQLite and PostgreSQL JSON exports.
+- Signed and notarized macOS server archives with the Foundation Developer ID, alongside the desktop installers, and verify their notarization tickets on a clean runner before publication.
+- Allow macOS release automation to select its credential keychain explicitly on headless hosts.
+- Updated SQLite, virtual scrolling, Wrangler, and Oxc tooling while preserving runtime minimums and the 48-hour dependency release-age gate.
+- Updated DOMPurify, Vite, Electron 43, desktop packaging, Wrangler, Node.js types, and pnpm while preserving runtime minimums and the 48-hour dependency release-age gate; Docker builds now include every workspace manifest for frozen-lockfile validation.
+- Corrected the source-install pnpm version and quickstart caller-authentication count to match the current toolchain and authentication guide. Thanks @KrasimirKralev.
+
+## 0.6.0 - 2026-09-24
+
+**Highlights:** Phone alerts with per-device controls and automatic OIDC endpoint discovery.
+
+- Added opt-in phone and browser alerts over standard Web Push, with session-bound devices, key rotation, and private previews restricted to the signed-in account. Thanks @isaiahknight-va.
+- Added automatic OIDC authorization and token endpoint discovery for providers such as Kanidm, with exact issuer validation and preserved endpoint overrides. Thanks @AdamClaassens.
+- Updated Electron 43 for hidden-window startup fixes on Windows and Linux, and refreshed virtual scrolling and build tools while preserving runtime minimums and the dependency release-age gate.
+
+## 0.5.2 - 2026-09-24
+
+**Highlights:** Visible macOS menu icons, reliable trackpad actions, and Markdown text that stays intact.
+
+- Fixed the macOS menu bar icon disappearing on dark menu bars by preserving the template flag after resizing. Thanks @isaiahknight-va.
+- Restored trackpad message actions in chat and embeds, kept new reactions visible without undoing later scrolling, and prevented text selection over the iOS action sheet. Thanks @isaiahknight-va.
+- Fixed disappearing text after empty nested Markdown quotes and updated virtual scrolling, SQLite runtime support, and build tools while retaining runtime minimums and the dependency release-age gate.
+
+## 0.5.1 - 2026-09-21
+
+**Highlights:** Safer exports, reliable sign-in, and chat status indicators that stay clear of messages.
+
+- Prevent JSON exports from overwriting their source SQLite database or its journal files, including paths reached through filesystem aliases.
+- Patched `js-yaml` and `xmldom` advisories in the desktop packaging and OpenAPI tooling dependencies, and aligned the OpenAPI generator with its supported TypeScript compiler API.
+- Preserve generated JavaScript literals during web builds, preventing whitespace cleanup from corrupting syntax grammars and Svelte class handling.
+- Fixed desktop sign-in behind Cloudflare Access One-time PIN by completing authentication in an isolated window sharing the app's session; multi-domain Access apps require Eager redirect cookie disabled. Thanks @sercada.
+- Fixed the typing indicator covering and clipping the last message, and the responding indicator resizing thread replies, by reserving one steady status band above both composers. Thanks @isaiahknight-va.
+- Updated SQLite, Markdown rendering, scrolling, Electron 43, and development tools while preserving the supported runtime minimums and dependency release-age gate.
+- Reduce server archive downloads by omitting development proof captures, and include all offline guides and README images on every platform.
+- Avoid PostgreSQL test fixture collisions when parallel tests start within the same clock tick.
+- Fixed account settings opening integrations in the wrong workspace and leaving the mobile navigation drawer open beneath the dialog. Thanks @isaiahknight-va.
+- Fixed moderators being offered channel settings they cannot save, and return a clear permission error for denied channel updates in both database stores. Thanks @sercada.
+- Updated Virtua, Wrangler, transitive build dependencies, the pinned AWS CLI, and the PostgreSQL CI service while retaining the 48-hour release-age gate and supported runtime minimums.
+- Hide OpenClaw ID sign-in when the server has not configured it, and show the correct sign-in guidance for OpenClaw-only servers.
+- Fixed saved choices to reveal agent commentary or tool calls being overridden by an older combined hide-activity setting after reload.
+- Updated Vite, Electron 43, desktop packaging, Wrangler, pnpm and build image/tool pins while preserving Node.js 24, macOS 12 and Go 1.26.6 minimums; CI now covers web utilities on Node.js 24 and 26 and avoids duplicate Go tests and unnecessary job dependencies.
+
+## 0.5.0 - 2026-09-11
+
+**Highlights:** Quieter server access logs with explicit operator controls.
+
+- Added `serve --access-log=all|errors|off`, `CLICKCLACK_ACCESS_LOG`, and the `access_log` configuration key, preserving full request logging by default and panic diagnostics in every mode. Thanks @isaiahknight-va.
+- Updated DOMPurify, Marked, and Virtua for browser rendering and scrolling maintenance.
+- Updated PostgreSQL, Go cryptography, OAuth, terminal, and platform dependencies while preserving the Go 1.26.6 minimum and existing database and password formats.
+- Updated Node.js types, Oxc tooling, Wrangler, and the pnpm setup action while retaining the 48-hour dependency release-age gate, Node.js 24 minimum, and macOS 12 desktop support.
+
+## 0.4.1 - 2026-09-07
+
+**Highlights:** Complete attachment delivery and reliable unread and reaction controls.
+
+- Committed channel and direct-message attachments before creation events, preserved complete attachments on nonce replay, and kept already-committed channel sends recoverable after moderation changes. Thanks @sercada.
+- Kept the unread bar readable and clickable above message menus and reaction pickers. Thanks @isaiahknight-va.
+- Fixed removal of percent-containing reaction keys without double-decoding them, and clarified glyph-based bot reactions while preserving custom strings. Thanks @isaiahknight-va.
+- Kept the mobile thread drawer above raised message rows and prevented the navigation toggle from covering its header. Thanks @isaiahknight-va.
+- Updated in-app brand tiles to use the Keystroke mark.
+- Updated PDF.js to 6.3.289, virtua to 0.51.0, and Electron to 43.6.0 for rendering, scrolling, and desktop runtime fixes while retaining the macOS 12 minimum and dependency release-age gate.
+- Updated the server build toolchain to Go 1.27.1, SQLite driver to 1.58.0, and Go cryptography dependency to 0.56.0 while retaining the Go 1.26.6 minimum and existing database and password formats.
+- Updated Playwright to 1.63.0 and Wrangler to 4.129.0 alongside pnpm 11.25.0, Node.js types, Oxc tooling, and the Pages/AWS credential actions; aligned Docker builders with the source toolchains while preserving runtime minimums and the dependency release-age gate.
+
+Thanks @KrasimirKralev for member-directory validation coverage.
+
+## v0.4.0 - 2026-09-02
+
+### Highlights
+
+- **Chat that keeps your place.** Long threads now open at the latest replies and page beyond the first 100. Live messages, search results, quote jumps, drafts, and unread markers stay consistent as history loads and connections recover.
+- **Working embedded chat, familiar faces.** Formatting, GIF, profile, and image controls work in embedded conversations. Operators can map existing ClickClack accounts to OpenClaw profiles and reuse their names and avatars while preserving message authors and custom avatar overrides.
+- **More ways to sign in.** Added browser sign-in with OpenClaw ID and optional local passwords for offline and self-hosted teams. Administrators enroll password users; users can change their password and sign out other devices. Enable local passwords with `--password-auth`. Thanks @isaiahknight-va.
+- **A fresh look on every desktop.** Introduced the Keystroke logo across the app, desktop icons, tray, and product website, and redesigned native Settings with clearer controls and save/test feedback.
+
+### Chat and everyday use
+
+- Start DM now searches the complete workspace directory, including people who have never posted. Person actions reopen the exact one-to-one conversation instead of a group containing that person. Thanks @isaiahknight-va for the directory report.
+- Added configurable workspace home destinations and labels, including desktop navigation and long-label support. Thanks @sercada.
+- Preserved reading positions in long threads and growing same-author message groups, kept user scrolling in control, and prevented horizontal message scrolling from moving the surrounding app.
+- Kept newer edits, deletions, reactions, pins, and confirmed sends intact when delayed history or save responses arrive. Failed attachment linking retries against the already-sent message without changing its text.
+- Preserved drafts and quotes after failed replies, and prevented delayed loads or actions from reopening closed panes, replacing newer selections, or hiding navigation errors. Failed workspace, channel, and DM creation remains visible and retryable.
+- Fixed refreshes hiding live messages or notifications, duplicate alerts after reconnect, and visible live messages remaining unread after their rows settle.
+- Preserved IME composition, modifier shortcuts, caret position, and the active control's Escape behavior in composers, inline editing, and the GIF picker. Restored clickable controls on virtualized message rows.
+- Kept profile and notification saves independent across tabs. Closing, switching, or reopening Settings retires old requests so they cannot erase a new draft, close the new view, or restore stale appearance.
+- Fixed member-directory pagination across chat, embeds, and workspace settings, restored newer embedded messages and avatar fallbacks, and allowed workspace profile updates to retain provisioned slugs. Thanks @SebTardif and @sercada.
+- Kept failed desktop server saves from switching the active connection, and prevented old sign-in attempts or saves from affecting a replacement server or Settings window.
+
+### Sign-in, bots, and self-hosting
+
+- Returned chat and embeds to sign-in when sessions expire, cleared content after workspace access is lost, and kept temporary server failures retryable. Revoked or replaced bot credentials now close already-open realtime sockets.
+- Fixed concurrent first GitHub sign-ins and HTTPS cookie handling behind trusted proxies while preserving account details and explicit profile overrides. Thanks @vincentkoc.
+- Preserved durable realtime event ordering through concurrent database commits and delayed publication, restored idle socket handling, and drained active requests before server shutdown.
+- Bounded stalled R2 headers and response reads while allowing progressing transfers to finish. Truncated downloads now fail, and stored object addresses correctly encode spaces and reserved characters. Thanks @SebTardif.
+- Bounded hanging browser API and slash-command requests while retaining streaming uploads, and hardened API pagination limits. Thanks @SebTardif and @vincentkoc.
+- Fixed concurrent PostgreSQL channel updates overwriting omitted fields, and rechecked message access when recovering interrupted sends.
+
+### CLI, SDK, and maintenance
+
+- Preserved CLI thread paging metadata and latest/cursor windows, corrected workspace/channel resolution, and surfaced discovery failures instead of silently selecting nothing.
+- Aligned TypeScript SDK resource types with the generated API contract, preserved opaque realtime metadata, and kept bot close callbacks attached to the correct socket across stop/restart.
+- Updated Go, SQLite, web, Electron 43, pnpm, Cloudflare, container, and CI dependencies while retaining macOS 12 desktop support.
+- Preserved complete docs navigation labels, fixed FakeCo fixtures in checkout paths containing spaces, and isolated parallel browser tests without adding retries or increasing timeouts. Thanks @vincentkoc and @isaiahknight-va.
+
+Thanks also to @KrasimirKralev for simplifying realtime internals.
+
+## v0.3.1 - 2026-08-14
+
+- Updated the minimum Go toolchain to 1.26.6 to resolve GO-2026-5026, GO-2026-5972, GO-2026-6090, and GO-2026-6218.
+
+## v0.3.0 - 2026-08-13
+
+**Highlight:** conversations get real organization — topics with filtered
+timelines, channel-wide pins, per-channel notification preferences, and
+copyable links to any message or thread.
+
+- Added coherent conversation organization and attention tools: topic selection and filtered timelines, channel-wide pins with a visible 100-message ceiling, per-channel all/mentions/muted notification preferences, resolved mention highlighting whose current-user emphasis follows that preference, and workspace-visible responding-agent identity beside channel and thread composers. Thanks @PollyBot13 and @jjjhenriksen.
+- Added stable, permission-checked Copy link actions for channel root messages, with lazy route allocation, canonical configured-origin URLs, and an accessible clipboard fallback.
+- Hardened integration callbacks against server-side requests to non-public networks and enforced guest visibility, moderation, and write limits for topics and registered slash commands. Thanks @jason-allen-oneal.
+- Fixed blank embedded views caused by stale browser assets and returned proper JSON errors for unknown API routes while preserving app deep links.
+- Fixed the crowded-rail layout regression where creating a workspace with many existing workspaces scrolled the form out of view. Thanks @sercada.
+- Updated web font, sanitizing, Markdown, virtualization, and build packages plus Electron and the Cloudflare Wrangler toolchain.
+- Updated the Go SQLite driver and runtime, formatting and linting tools, and pnpm toolchain.
+## 0.2.2 - 2026-08-01
+
+- Updated Go, web, desktop, Cloudflare, CI action, package-manager, and container-base dependencies.
+- Fixed bot topic endpoints accepting cross-workspace list and create operations by enforcing the token workspace scope. Thanks @ShiroKSH.
+- Fixed right-aligned messages rendering Markdown lists and blockquotes outside the message bubble. Thanks @jjjhenriksen.
+- Added optional human-readable channel display titles while preserving slug-based routing and uniqueness.
+- Added agent-friendly CLI commands for adding and removing message reactions through the existing public APIs, with exact JSON output and terminal-safe human output. Thanks @PollyBot13.
+- Removed the redundant "Open in ClickClack" link from embedded channel headers, leaving external navigation to the host's own control.
+- Fixed the embedded channel view overflowing narrow host panels (such as OpenClaw's discussion sidebar), where long session channel names clipped the header link and send button off the right edge.
+- Fixed the thread panel enforcing a ~370px minimum width, which clipped the thread embed and full-screen mobile threads in hosts narrower than 370px.
+- Compacted the embedded channel and thread headers and aligned the embed composer gutters and bottom spacing with narrow host panels.
+- Added Gravatar fallbacks for email-backed users without an explicit or provider-supplied avatar.
+- Added an accessible large-image lightbox for chat and thread attachments with focus containment, focus restoration, backdrop dismissal, and responsive full-screen mobile presentation.
+- Hardened realtime recovery with ordered client application, post-success cursor checkpoints, paged connect-time replay, explicit overflow reconnects, and stale message-load protection.
+
+## 0.2.1 - 2026-07-19
+
+- Shipped the first signed and notarized macOS desktop release bundles with the OpenClaw Foundation identity, hardened runtime, and strict sealed-artifact verification.
+- Added optional Cloudflare Access trusted-proxy SSO with pinned-team JWKS verification, automatic workspace provisioning, and normal ClickClack sessions.
+- Added externally managed channel identity and deep links, archive-aware and sectioned sidebar groups, archive event metadata, and a live standalone channel embed.
+- Fixed the thread reply composer send button sitting mid-row instead of flush right in thread panels and embeds.
+- Added a standalone, live-updating, cookie-authenticated thread embed with the shared thread composer and rendering, public route IDs, focused auth recovery, and an opt-in per-origin `/embed/*` frame policy.
+
+## 0.2.0 - 2026-07-17
+
+### Highlights
+
+- Added a complete integrations workspace with an app catalog, guided installer, slash commands, event subscriptions, delivery history, connected accounts, durable event types, and OpenAPI/SDK support.
+- Added secure server-issued bot setup codes and validated split frontend/API origins with exact claim URLs, canonical API bases, credentialed CORS, and fully compatible same-origin defaults.
+- Added paginated SQLite/Postgres message search with matched context, persistent sidebar results, canonical thread handoff, and SDK pagination. Thanks @jjjhenriksen.
+- Added a bounded artifact viewer for code, text, Markdown, PDF, sandboxed HTML, spreadsheets, and slide decks. Thanks @jjjhenriksen.
+- Redesigned the app, product site, and desktop shell around the Switchboard identity with light/dark/system modes, four board themes, and unified native chrome.
+
+### Integrations and automation
+
+- Tightened integration administration with manager-only mutations, signing-secret rotation, atomic revoke cascades, reusable installations, bounded delivery cursors, and retry-safe setup workflows.
+- Added scoped bot command menus across storage, API, SDK, workspace settings, and the composer, including canonical slash-command dispatch and moderation-aware lifecycle handling.
+- Added guided OpenClaw connection commands, explicit bot/app connection methods, tokenless bot creation, exclusive credential reveals, and replay-safe setup defaults.
+- Added versioned, rate-limited, single-use bot setup-code claims that mint credentials atomically and return server-issued exact claim and canonical API endpoints.
+- Added durable bot deletion that retires identities, resources, direct messages, sockets, integrations, and tokens while preserving historical attribution.
+- Added SDK helpers for paginated realtime recovery, bounded latest thread history, and typed agent-progress payloads while retaining workspace-wide events without channel or DM targets. Thanks @arcabotai for surfacing the integration needs.
+- Added owner-scoped message nonce recovery and durable upload idempotency so interrupted clients can reconcile sends and reuse uploads without consuming duplicate storage or quota. Thanks @shakkernerd.
+
+### Chat and workspace
+
+- Added paginated SQLite/Postgres message search with bounded enrichment, matched snippets, persistent sidebar sessions, stale-response protection, canonical thread routes, and SDK pagination. Thanks @jjjhenriksen.
+- Added a bounded read-only artifact pane for code, text, Markdown, PDF, and sandboxed HTML plus safe spreadsheet and slide-deck previews with strict work/output limits. Thanks @jjjhenriksen.
+- Added personal channel ordering with drag-and-drop, keyboard/touch move controls, cross-tab persistence, and active/unread preservation inside independently collapsible sidebar sections. Thanks @jjjhenriksen.
+- Added independent message alignment, selectable standard/outlined layouts, softer message surfaces, and accessible appearance controls. Thanks @jjjhenriksen and @ragesaq.
+- Added manager workspace profile/icon controls, owner transfer and permanent deletion, and owner-or-author message deletion with confirmation and durable upload cleanup. Thanks @Solvely-Colin.
+- Expanded account and workspace settings with paginated/virtualized members, role totals, bot management, and workspace-isolated state.
+- Fixed live agent-activity bursts to coalesce same-turn progress without dropping realtime rows or pulling bottom-pinned timelines away from the live edge.
+- Restored brand-gradient contrast and enforced the repository pnpm runtime policy. Thanks @vincentkoc.
+
+### Platform, security, and operations
+
+- Hardened GitHub and desktop OAuth with persisted transactions and grants, PKCE, versioned handoff, bounded metrics, canonical origins, redacted failures, and production cookie namespaces. Thanks @ragesaq.
+- Added validated split-origin deployment configuration with strict administrator URL trust, exact-origin CORS/CSRF/WebSocket checks, secure cookie policy, API base paths, and server-injected browser configuration.
+- Added opt-in realtime tail cursors, read-receipt-aware pagination, and validated correlation metadata across replay, realtime delivery, and canary evidence. Thanks @shakkernerd.
+- Added an isolated FakeCo small-VM/AWS staging path with idempotent seed data, SecretRef configuration, correlated health/readiness telemetry, a quoted-reply canary, and teardown guidance.
+- Serialized SQLite writers across processes, configured every connection consistently, and hardened nonce finalization, quota accounting, claim lifecycles, and workspace deletion races.
+- Allowed disabled Pushover settings to clear stored user keys through the public API contract. Thanks @vincentkoc.
+- Proxied WebSocket upgrades in the Vite development server so local realtime connects without a reconnect loop.
+- Refreshed frontend, Electron, Cloudflare Worker, router, SQLite, Node, pnpm, GoReleaser, GitHub Actions, and container bases to their latest stable releases.
+- Aligned the pull-request template with the repository workflow. Thanks @hannesrudolph.
+## 0.1.0 - 2026-07-06
+
+- Published automated macOS, Windows, and Linux desktop installers with verified SHA-256 manifests alongside every tagged GitHub Release.
+- Integrated the desktop sidebar toggle and message search into native macOS, Windows, and Linux title bars while preserving the browser app header.
+- Added secure ClickClack desktop apps for macOS, Windows, and Linux with native notifications, unread badges, tray lifecycle, quick compose, deep links, downloads, spellcheck, and self-hosted server selection.
+- Opened desktop GitHub sign-in in the system browser, then returned securely through a short-lived, verifier-bound `clickclack://` callback so existing browser sessions, passkeys, and two-factor authentication work without exposing tokens in URLs.
+- Served clickclack.chat and www.clickclack.chat from the Cloudflare Worker as declarative custom domains in `wrangler.jsonc`, retiring the separate Hetzner web host; container image rollouts are forced by bumping the dated `CLICKCLACK_CONTAINER_NAME`.
+- Redesigned the clickclack.chat product website with a modern Geist-based look that matches the app: sticky nav, app-mockup hero, feature grid, CLI terminal, quickstart steps, and full dark-mode support.
+- Refreshed runtime, build, and CI dependencies to clear known JavaScript advisories and pin current GitHub Actions releases.
+- Wrote CLI client configuration atomically while preserving read-only-file and symlink safety. Thanks @KrasimirKralev.
+- Added bot-scoped durable agent commentary and tool activity, collapsed into per-turn preambles with independent visibility controls and configurable self-message alignment. Thanks @ragesaq.
+- Added persistent thread activity counts and row-click thread opening in channel and DM timelines, with live summary refreshes. Thanks @PollyBot13.
+- Added per-user DM closing with durable history, direct-link access, Undo, canonical one-to-one reopening, and automatic resurfacing on new messages. Thanks @PollyBot13.
+- Kept self-hosted landing-page App links on the instance-local `/app` route for Tailscale, LAN, and custom hostnames instead of redirecting to the hosted app. Thanks @iXandru for the report and @TurboTheTurtle for the fix.
+- Reused the canonical two-member direct conversation for repeated DM creates so bot replies no longer split across duplicate chats. Thanks @PollyBot13 for the report.
+- Added opt-in browser notifications for incoming channel and direct messages, including click-through navigation. Thanks @PollyBot13.
+- Rendered ephemeral agent progress activity lines in web chat for live tool, thinking, plan, patch, and command updates. Thanks @ragesaq.
+- Allowed normal bot-write tokens to publish ephemeral agent progress while keeping progress frames bot-only and target-scoped. Thanks @ragesaq and @shakkernerd.
+- Fixed the mobile sidebar collapse control so it closes the open drawer on narrow screens without changing the desktop collapse preference. Thanks @iXandru for the report.
+- Fixed the mobile web layout on iPhone Safari so the closed navigation drawer fully leaves the viewport and the composer respects safe areas.
+- Revived the platform app APIs for bot lifecycle, app installation, slash
+  command registration/invocation, event subscriptions, connected accounts,
+  audit events, and message topics; the web composer now previews registered
+  slash commands on `/` and workspace mentions on `@` without shifting the
+  message timeline.
+- Rejected negative byte sizes when finalizing reserved uploads so quota accounting cannot be credited by malformed store calls.
+- Kept the infra SQLite migration mirror in sync with the embedded guest moderation migration.
+- Required DM bot scopes on generic message, thread, reaction, upload, and typing routes when the target resource belongs to a direct conversation.
+- Reserved upload quota before object storage writes so concurrent uploads cannot overspend a workspace budget.
+- Stopped blocked or timed-out moderators from receiving private member-moderation events.
+- Prevented workspace moderators from moderating privileged bot members.
+- Reserved the `guest` channel name, locked Postgres moderation role checks during member updates, and bounded direct-conversation member sets after DeepSec review.
+- Hardened JSON request body limits, realtime typing scope validation, and upload attachment authorization after DeepSec review.
+- Documented guest-room moderation, upload previews, Postgres/R2 deployment notes, and sqlc store workflow.
+- Added a guest waiting-room moderation flow with three-post daily guest limits, OpenClaw GitHub org moderator mapping, member approval, timeouts, blocks, and moderator profile controls.
+- Added first-page thumbnail previews for PDF uploads, thumbnail cards for text uploads, inline audio controls in chat messages, and open GitHub guest-room sign-in.
+- Redacted stored token hashes and upload storage paths from JSON exports, and constrained local upload serving/deletion to the configured upload directory.
+- Bounded outbound upload and GitHub OAuth HTTP calls with default timeouts, streamed R2 upload saves without full in-memory buffering, and constrained R2 object access to the configured prefix.
+- Allowed upload clients to pass `workspace_id` as a query parameter so multipart file parts no longer depend on form field ordering.
+- Disabled public magic-link request minting when dev auth is off, keeping CLI-created magic links as the production path until delivery is configured.
+- Restricted dev-bootstrap magic-link token minting to loopback clients.
+- Restricted dev-bootstrap user-header and first-user fallback auth to loopback clients.
+- Defaulted session cookies to `Secure` outside local dev HTTP, even when proxy HTTPS headers are missing.
+- Kept Pushover notification HTTP calls bounded even when a notifier is constructed without an explicit client.
+- Included channel and direct-message read receipts in JSON exports.
+- Exported JSON from one read transaction snapshot for SQLite and Postgres stores.
+- Redacted Pushover user keys from JSON exports.
+- Stopped request logs from recording OAuth callback query secrets and clear GitHub OAuth state cookies after callback validation.
+- Redacted invite tokens from JSON exports.
+- Required message-write scope and message authorship before attaching uploads to messages.
+- Rejected cross-site or non-JSON magic-link consume requests before setting session cookies.
+- Capped JSON request bodies and added full-request read timeouts to reduce slow or oversized request abuse.
+- Hid and detached uploads from deleted messages so deleted chat content is no longer exposed through attachment history or upload fetches.
+- Made `/api/me` profile and notification setting updates atomic so failed validation no longer persists partial profile changes.
+- Restricted channel rename, archive, and kind changes to workspace owners and scoped bots, while preserving an owner for OAuth-created default workspaces.
+- Serialized Postgres migrations with an advisory lock to avoid multi-instance startup races.
+- Kept the infra SQLite migration mirror in sync with the embedded auth token-hash migration.
+- Made channel and direct-message read receipt writes monotonic in SQLite and Postgres so concurrent older updates cannot move read cursors backwards.
+- Rejected cross-site browser requests from local dev magic-link minting and fallback auth even when the TCP peer is loopback.
+- Serialized SQLite message sequence allocation so concurrent channel, direct-message, and thread writes cannot collide on the same next sequence number.
+- Made repeated message deletes idempotent in SQLite and Postgres so deletion timestamps and durable events are not rewritten.
+- Parsed auth expiration and event retention timestamps instead of comparing raw timestamp text in SQLite and Postgres.
+- Joined GitHub allowed-org users to the explicit ClickClack default workspace instead of whichever workspace was created first.
+- Added a Postgres attachment lookup index so upload visibility checks can find shared messages by upload ID efficiently.
+- Limited the default-workspace owner repair migration to the ClickClack workspace so public guest workspaces are not promoted accidentally.
+- Returned saved notification settings from session-authenticated `/api/me` responses so profile saves do not clear Pushover preferences.
+- Made concurrent Postgres default workspace joins retry the winning workspace instead of failing first GitHub org logins.
+- Published realtime message update events when uploads are attached so other clients refresh message attachments immediately.
+- Returned moderation-restricted errors for blocked channel update attempts before checking channel-admin privileges.
+- Rejected cookie-authenticated unsafe API requests unless they carry the first-party CSRF header and pass same-origin browser checks.
+- Required ephemeral realtime events with `channel_id` to target a channel the sender can access in the requested workspace.
+- Blocked legacy direct-message realtime backlog events for guests when payloads only referenced message IDs.
+- Preserved existing SQLite magic links and sessions while backfilling token hashes during auth-token migrations.
+- Prevented late message edits from rewriting a message body after the message has been deleted.
+- Reserved system workspace slugs, made SQLite default workspace joins concurrency-safe, and rechecked channel access before replaying nonce-idempotent messages.
+- Added per-user workspace upload quotas so unattached uploads cannot grow storage without bound.
+- Blocked moderated users from publishing realtime typing and presence events.
+- Added a bounded indexed lookup for upload attachment visibility checks.
+- Hardened production defaults and deepsec-reported security edges: dev auth now requires explicit opt-in, Docker starts fail-closed, WebSockets enforce origin checks while supporting SDK bearer-token protocols, uploads no longer expose storage paths or execute as same-origin HTML, magic-link consumption is atomic, session cookies become secure on HTTPS public URLs, and CI/release supply-chain refs are pinned.
+- Added optional Cloudflare R2 upload storage via `CLICKCLACK_UPLOADS=r2://bucket/prefix`, keeping local disk as the default backend.
+- Added Postgres as an alternate server store via `postgres://` / `postgresql://` DB URLs, including migrations, search, CLI env defaults, and an opt-in Postgres integration smoke test.
+- Fixed clawpatch-reported CLI export/listing, config precedence, auth token redaction, bot workspace isolation, upload cleanup/privacy, deleted-message search, reaction no-op events, DM revocation, thread nonce, and coverage edge cases.
+- Fixed `pnpm test` so it no longer rewrites embedded web assets, and made the release asset embedding step preserve the existing embedded app if the copy fails.
+- Remember the last visited channel per workspace in the web app so returning
+  to a bare workspace route no longer jumps back to the first channel in the
+  list. Thanks @shakkernerd.
+- Set the web app favicon to the ClickClack icon. Thanks @shakkernerd.
+- Added short public route IDs for workspace, channel, DM, and thread URLs while
+  preserving internal IDs and canonicalizing older copied links. Thanks
+  @shakkernerd.
+- Added first-class bot identities with human vs bot user kind, service-bot
+  and user-owned bot records, scoped `ccb_...` bot tokens, CLI bot creation,
+  bot-token auth checks, OpenAPI/SDK/web type coverage, visible bot badges,
+  and a bot architecture spec for the OpenClaw extension path.
+- Fixed profile contact-information icons so the glyph stays centered inside
+  its square tile.
+- Forced Playwright E2E runs to stay headless by default across local and CI
+  invocations.
+- Moved channel and direct-message creation into modal flows opened from
+  right-aligned sidebar section plus buttons, removing the always-visible
+  inline create fields.
+- Renamed the README header to `ClickClackClaw` with a paw-print mark and a
+  short OpenClaw chat tagline.
+- Fixed the chat shell realtime connection badge and mobile navigation drawer
+  behavior, including backdrop/Escape close handling and type-to-focus blocking
+  while navigation is open. Thanks @BunsDev.
+- Added optional per-user Pushover notifications for new channel, thread, and
+  DM messages. Server admins configure `CLICKCLACK_PUSHOVER_API_TOKEN`; users
+  opt in from account settings with their own Pushover user key. Thanks
+  @thewilloftheshadow.
+- Polished profile pane/profile settings actions and message hover states so
+  buttons share the same height, contact icons stay centered, and hovered
+  messages no longer also highlight the inner text row.
+- Added cursor pagination for channel and DM history. Message lists now
+  support latest, before, after, and around sequence windows with page
+  metadata, while the web chat keeps a bounded active message window, loads
+  older and newer history as users move through the timeline, and opens search
+  or quote targets with around-sequence context without breaking the
+  after-sequence API contract. Thanks @shakkernerd.
+- Added route-driven chat URLs for workspace, channel, DM, and thread views so
+  direct links, refresh, and browser back/forward restore the selected
+  conversation without leaving stale in-memory navigation state. Thanks
+  @shakkernerd.
+- Fixed live-message handling while reading older history so incoming messages
+  mark the current window as having newer history instead of silently paging
+  the timeline forward.
+- Added a persistent in-timeline "New" divider and unread bar for unread
+  channel and DM messages. The divider anchors to the read boundary, the bar
+  jumps back to that boundary, and users can explicitly mark the view read
+  when they are done. Thanks @shakkernerd.
+- Added retry-safe optimistic sends, per-user unread/read receipts for
+  channels and DMs, private read events, and member-scoped DM typing
+  indicators. The chat UI now shows unread badges and jump-to-bottom unread
+  counts, reconciles pending sends across realtime/reload races, and exposes
+  the new read APIs through OpenAPI, the TypeScript SDK, and docs. Realtime
+  event cursors are now monotonic so same-millisecond events replay in order.
+  Thanks @shakkernerd.
+- Improved media previews and long message timelines: uploads now carry
+  image/video dimensions through SQLite, API responses, OpenAPI, and web
+  types; the chat timeline is virtualized with scroll restoration, bottom
+  pinning, and reliable quote jumps. Thanks @shakkernerd.
+- Added type-to-focus on the chat composer: pressing a printable key while
+  focus is outside any text field (and no modal/menu is open) now jumps the
+  caret to the active composer — the thread reply textarea when a thread pane
+  is open, otherwise the channel/DM composer — so the keystroke lands as the
+  next character of your draft. The composer also auto-grows as the draft
+  spans multiple lines, capped at half the viewport before a scrollbar appears,
+  and shrinks back to a single row after sending. IME
+  composition, modifier shortcuts, text fields, menus, media controls, and
+  active text selections inside messages or threads are preserved untouched.
+  Thanks @shakkernerd.
+- Added inline quote-replies in channels, DMs, and threads. Every
+  message-create endpoint now accepts an optional `quoted_message_id`; the
+  server captures a 280-rune trimmed snapshot of the quoted body plus the
+  quoted author at send time, and rejects cross-context quotes with
+  `HTTP 400`. The chat UI exposes a hover-revealed "Quote" affordance,
+  composer chip, click-to-jump quote block, and an "[original deleted]"
+  fallback when the source is hard-deleted (FK is `ON DELETE SET NULL` so
+  the snapshot survives). The `clickclack send` and `clickclack threads
+  reply` CLI commands gain `--reply-to msg_...` flags. See
+  [docs/features/replies.md](docs/features/replies.md). Thanks @shakkernerd.
+- Refined the chat app shell with denser chat navigation,
+  grouped message timelines, clearer empty states, responsive sidebars, and a
+  send button that no longer appears active for attachment-only drafts.
+- Added richer Slack-like chat affordances: animated sidebar/thread panels,
+  inline image attachment cards, Markdown composer controls, and a GIF picker
+  that inserts animated GIF Markdown.
+- Added Slack-style user profile side panes, automatic People shortcuts in the
+  sidebar, inline video playback, tighter message spacing, and an image viewer
+  modal for inline images.
+- Added controlled Markdown GIF playback: GIFs play briefly, pause on a still
+  preview, and expose a lower-right replay button.
+- Added a public product website at the web root while keeping the chat app at
+  `/app` locally and on `app.clickclack.chat` when served from that host.
+- Added an agent-friendly ClickClack client mode to the Go binary with
+  `login`, `logout`, `whoami`, `status`, workspace/channel listing, message
+  send/list, and thread open/reply commands.
+- Scoped stored CLI credentials and workspace/channel defaults to the saved
+  server URL, with `--user` / `CLICKCLACK_USER_ID` taking precedence over
+  stored bearer tokens unless `--token` is explicitly supplied.
+- Documented the `clickclack.chat` product domain, `app.clickclack.chat` app
+  domain, `docs.clickclack.chat` docs domain, and recommended bearer-token auth
+  flow for hosted agents.
+- Added more visible GitHub links to the product website and improved the docs
+  quickstart CTA contrast in dark mode.
+- Split GitHub Actions into explicit Go, TypeScript, Playwright, and Docker
+  gates, with `gofmt` and `oxfmt --check` enforced in CI.
+- Added GoReleaser config and release workflow for Linux, macOS, Windows, and
+  FreeBSD archives, plus Linux `.deb` and `.rpm` packages.

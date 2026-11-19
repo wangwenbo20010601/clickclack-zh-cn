@@ -1,0 +1,329 @@
+package sqlite
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"maps"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/oklog/ulid/v2"
+	"github.com/openclaw/clickclack/apps/api/internal/requestmeta"
+	"github.com/openclaw/clickclack/apps/api/internal/store"
+	"github.com/openclaw/clickclack/apps/api/internal/store/sqlite/storedb"
+)
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanUser(row scanner) (store.User, error) {
+	var user store.User
+	var owner sql.NullString
+	if err := row.Scan(&user.ID, &user.Kind, &owner, &user.DisplayName, &user.Handle, &user.AvatarURL, &user.CreatedAt); err != nil {
+		return store.User{}, err
+	}
+	user.OwnerUserID = stringFromNull(owner)
+	return user, nil
+}
+
+var (
+	idMu      sync.Mutex
+	idEntropy = ulid.Monotonic(rand.Reader, 0)
+)
+
+func getMessage(ctx context.Context, db *sql.DB, id string) (store.Message, error) {
+	return scanMessage(db.QueryRowContext(ctx, messageSelect()+` WHERE m.id = ?`, id))
+}
+
+func getMessageTx(ctx context.Context, tx *sql.Tx, id string) (store.Message, error) {
+	return scanMessage(tx.QueryRowContext(ctx, messageSelect()+` WHERE m.id = ?`, id))
+}
+
+func messageSelect() string {
+	return `SELECT m.id, COALESCE(m.route_id, ''), m.workspace_id, COALESCE(m.channel_id, ''), COALESCE(m.direct_conversation_id, ''), m.author_id, m.parent_message_id, m.thread_root_id, COALESCE(m.topic_id, ''), m.channel_seq, m.thread_seq,
+		       m.body, m.body_format, m.created_at, m.edited_at, m.deleted_at,
+		       u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+		       author_tombstone.former_handle, author_tombstone.deleted_at,
+		       m.quoted_message_id, m.quoted_body_snapshot, m.quoted_author_id,
+		       qu.id, qu.kind, qu.owner_user_id, qu.display_name, qu.handle, qu.avatar_url, qu.created_at,
+		       quoted_tombstone.former_handle, quoted_tombstone.deleted_at,
+		       m.client_nonce, m.kind, COALESCE(m.turn_id, '')
+		FROM messages m
+		JOIN users u ON u.id = m.author_id
+		LEFT JOIN bot_tombstones author_tombstone ON author_tombstone.bot_user_id = u.id
+		LEFT JOIN users qu ON qu.id = m.quoted_author_id
+		LEFT JOIN bot_tombstones quoted_tombstone ON quoted_tombstone.bot_user_id = qu.id`
+}
+
+func scanMessage(row scanner) (store.Message, error) {
+	var m store.Message
+	var parent, edited, deleted sql.NullString
+	var channelSeq, threadSeq sql.NullInt64
+	var author store.User
+	var quotedMessageID, quotedAuthorID sql.NullString
+	var authorOwnerID sql.NullString
+	var quAuthorID, quKind, quOwnerID, quDisplayName, quHandle, quAvatarURL, quCreatedAt sql.NullString
+	var authorFormerHandle, authorDeletedAt, quFormerHandle, quDeletedAt sql.NullString
+	var nonce string
+	err := row.Scan(
+		&m.ID, &m.RouteID, &m.WorkspaceID, &m.ChannelID, &m.DirectConversationID, &m.AuthorID, &parent, &m.ThreadRootID, &m.TopicID, &channelSeq, &threadSeq,
+		&m.Body, &m.BodyFormat, &m.CreatedAt, &edited, &deleted,
+		&author.ID, &author.Kind, &authorOwnerID, &author.DisplayName, &author.Handle, &author.AvatarURL, &author.CreatedAt,
+		&authorFormerHandle, &authorDeletedAt,
+		&quotedMessageID, &m.QuotedBodySnapshot, &quotedAuthorID,
+		&quAuthorID, &quKind, &quOwnerID, &quDisplayName, &quHandle, &quAvatarURL, &quCreatedAt,
+		&quFormerHandle, &quDeletedAt,
+		&nonce, &m.Kind, &m.TurnID,
+	)
+	if err != nil {
+		return store.Message{}, err
+	}
+	if parent.Valid {
+		m.ParentMessageID = &parent.String
+	}
+	if channelSeq.Valid {
+		m.ChannelSeq = &channelSeq.Int64
+	}
+	if threadSeq.Valid {
+		m.ThreadSeq = &threadSeq.Int64
+	}
+	if edited.Valid {
+		m.EditedAt = &edited.String
+	}
+	if deleted.Valid {
+		m.DeletedAt = &deleted.String
+	}
+	if authorOwnerID.Valid {
+		author.OwnerUserID = authorOwnerID.String
+	}
+	if authorFormerHandle.Valid {
+		author.FormerHandle = authorFormerHandle.String
+	}
+	if authorDeletedAt.Valid {
+		author.DeletedAt = &authorDeletedAt.String
+	}
+	m.Author = &author
+	if quotedMessageID.Valid {
+		m.QuotedMessageID = &quotedMessageID.String
+	}
+	if quotedAuthorID.Valid {
+		m.QuotedAuthorID = &quotedAuthorID.String
+	}
+	if quAuthorID.Valid {
+		m.QuotedAuthor = &store.User{
+			ID:          quAuthorID.String,
+			Kind:        quKind.String,
+			OwnerUserID: quOwnerID.String,
+			DisplayName: quDisplayName.String,
+			Handle:      quHandle.String,
+			AvatarURL:   quAvatarURL.String,
+			CreatedAt:   quCreatedAt.String,
+		}
+		if quFormerHandle.Valid {
+			m.QuotedAuthor.FormerHandle = quFormerHandle.String
+		}
+		if quDeletedAt.Valid {
+			m.QuotedAuthor.DeletedAt = &quDeletedAt.String
+		}
+	}
+	m.Nonce = nonce
+	return m, nil
+}
+
+func getMessageByClientNonceTx(ctx context.Context, tx *sql.Tx, authorID, nonce string) (store.Message, error) {
+	if nonce == "" {
+		return store.Message{}, sql.ErrNoRows
+	}
+	return scanMessage(tx.QueryRowContext(ctx, messageSelect()+` WHERE m.author_id = ? AND m.client_nonce = ?`, authorID, nonce))
+}
+
+func sameQuotedMessageID(message store.Message, quotedID string) bool {
+	if quotedID == "" {
+		return message.QuotedMessageID == nil || *message.QuotedMessageID == ""
+	}
+	return message.QuotedMessageID != nil && *message.QuotedMessageID == quotedID
+}
+
+func resolveProfileAvatarURL(ctx context.Context, q *storedb.Queries, userID, avatarURL string) (string, error) {
+	if avatarURL != "" {
+		return avatarURL, nil
+	}
+	email, err := q.GetIdentityEmailForUser(ctx, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return store.ResolveAvatarURL("", email), nil
+}
+
+func scanMessages(rows *sql.Rows) ([]store.Message, error) {
+	out := []store.Message{}
+	for rows.Next() {
+		msg, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, msg)
+	}
+	return out, rows.Err()
+}
+
+func getThreadState(ctx context.Context, db *sql.DB, rootID string) (store.ThreadState, error) {
+	row, err := storedb.New(db).GetThreadState(ctx, rootID)
+	if err != nil {
+		return store.ThreadState{}, err
+	}
+	return storeThreadStateFromDB(row), nil
+}
+
+func updateThreadState(ctx context.Context, tx *sql.Tx, rootID, authorID, createdAt string) (store.ThreadState, error) {
+	q := storedb.New(tx)
+	row, err := q.GetThreadState(ctx, rootID)
+	if err != nil {
+		return store.ThreadState{}, err
+	}
+	state := storeThreadStateFromDB(row)
+	ids := append([]string{authorID}, state.LastReplyAuthorIDs...)
+	seen := map[string]bool{}
+	compact := make([]string, 0, 3)
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		compact = append(compact, id)
+		if len(compact) == 3 {
+			break
+		}
+	}
+	body, _ := json.Marshal(compact)
+	if err := q.UpdateThreadState(ctx, storedb.UpdateThreadStateParams{
+		LastReplyAt:            sqlText(createdAt),
+		LastReplyAuthorIdsJson: string(body),
+		RootMessageID:          rootID,
+	}); err != nil {
+		return store.ThreadState{}, err
+	}
+	row, err = q.GetThreadState(ctx, rootID)
+	if err != nil {
+		return store.ThreadState{}, err
+	}
+	return storeThreadStateFromDB(row), nil
+}
+
+func insertEvent(ctx context.Context, tx *sql.Tx, workspaceID, channelID, eventType string, seq *int64, payload any) (store.Event, error) {
+	return insertEventWithRecipients(ctx, tx, workspaceID, channelID, eventType, seq, payload, nil)
+}
+
+func insertEventWithRecipients(ctx context.Context, tx *sql.Tx, workspaceID, channelID, eventType string, seq *int64, payload any, recipientUserIDs []string) (store.Event, error) {
+	return insertEventWithRecipientsAndMentions(ctx, tx, workspaceID, channelID, eventType, seq, payload, recipientUserIDs, nil)
+}
+
+func insertEventWithRecipientsAndMentions(ctx context.Context, tx *sql.Tx, workspaceID, channelID, eventType string, seq *int64, payload any, recipientUserIDs, mentionedUserIDs []string) (store.Event, error) {
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return store.Event{}, err
+	}
+	recipients := compactStrings(recipientUserIDs)
+	mentions := compactStrings(mentionedUserIDs)
+	mentionedJSON, err := json.Marshal(mentions)
+	if err != nil {
+		return store.Event{}, err
+	}
+	q := storedb.New(tx)
+	// The immediate write transaction serializes this frontier read through commit.
+	frontier, err := q.LatestWorkspaceEventCursor(ctx, workspaceID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return store.Event{}, err
+	}
+	cursor, err := store.EventCursorAfter(newID("cur"), frontier)
+	if err != nil {
+		return store.Event{}, err
+	}
+	event := store.Event{
+		ID:               newID("evt"),
+		Cursor:           cursor,
+		Type:             eventType,
+		WorkspaceID:      workspaceID,
+		ChannelID:        channelID,
+		Seq:              seq,
+		CreatedAt:        now(),
+		PayloadJSON:      string(payloadJSON),
+		Payload:          payload,
+		MentionedUserIDs: mentions,
+	}
+	isPrivate := 0
+	if len(recipients) > 0 {
+		isPrivate = 1
+	}
+	if err := q.InsertEvent(ctx, storedb.InsertEventParams{
+		ID:               event.ID,
+		Cursor:           event.Cursor,
+		WorkspaceID:      event.WorkspaceID,
+		ChannelID:        sqlOptionalText(event.ChannelID),
+		Type:             event.Type,
+		Seq:              nullInt64FromPtr(event.Seq),
+		PayloadJson:      event.PayloadJSON,
+		CreatedAt:        event.CreatedAt,
+		IsPrivate:        int64(isPrivate),
+		MentionedUserIds: string(mentionedJSON),
+	}); err != nil {
+		return store.Event{}, err
+	}
+	for _, userID := range recipients {
+		if err := q.InsertEventRecipient(ctx, storedb.InsertEventRecipientParams{EventID: event.ID, UserID: userID}); err != nil {
+			return store.Event{}, err
+		}
+		event.RecipientUserIDs = append(event.RecipientUserIDs, userID)
+	}
+	return event, nil
+}
+
+// eventPayload adds optional client and request correlation metadata to durable
+// message creation events without copying message content.
+func eventPayload(ctx context.Context, base map[string]string, nonce string) map[string]string {
+	correlationID := requestmeta.CorrelationID(ctx)
+	if nonce == "" && correlationID == "" {
+		return base
+	}
+	out := make(map[string]string, len(base)+2)
+	maps.Copy(out, base)
+	if nonce != "" {
+		out["nonce"] = nonce
+	}
+	if correlationID != "" {
+		out["correlation_id"] = correlationID
+	}
+	return out
+}
+
+func newID(prefix string) string {
+	idMu.Lock()
+	id := ulid.MustNew(ulid.Timestamp(time.Now()), idEntropy)
+	idMu.Unlock()
+	return prefix + "_" + strings.ToLower(id.String())
+}
+
+func now() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+var slugRE = regexp.MustCompile(`[^a-z0-9]+`)
+
+func slug(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = slugRE.ReplaceAllString(value, "-")
+	return strings.Trim(value, "-")
+}
+
+func isReservedWorkspaceSlug(value string) bool {
+	return value == "clickclack" || value == "guests"
+}

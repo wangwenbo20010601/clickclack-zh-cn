@@ -1,0 +1,1391 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+)
+
+// ErrQuotedMessageOutOfScope is returned when a message tries to quote another
+// message that does not belong to the same channel, direct conversation, or
+// thread. It is surfaced to API callers as a 400.
+var ErrQuotedMessageOutOfScope = errors.New("quoted message is not in this channel, conversation, or thread")
+
+// ErrClientNonceConflict is returned when a client reuses an idempotency nonce
+// for a different message request.
+var ErrClientNonceConflict = errors.New("client nonce was already used for a different message")
+
+// ErrSetupNonceConflict is returned when a retry-safe integration setup nonce
+// is reused with different inputs or after its credential was revoked.
+var ErrSetupNonceConflict = errors.New("setup nonce was already used for a different request")
+
+// ErrInvalidMessagePage is returned when a message-history request combines
+// mutually exclusive cursors or uses an invalid cursor value.
+var ErrInvalidMessagePage = errors.New("invalid message page request")
+
+// ErrInvalidEventDeliveryCursor is returned when a delivery-attempt cursor
+// does not exist for the requested subscription.
+var ErrInvalidEventDeliveryCursor = errors.New("invalid or stale event delivery cursor")
+
+// ErrModerationRestricted is returned when a workspace moderation rule blocks
+// a write. HTTP callers surface it as a 403 or 429 depending on the rule.
+var ErrModerationRestricted = errors.New("moderation restriction")
+
+// ErrChannelArchived is returned when a post targets an archived channel.
+var ErrChannelArchived = errors.New("channel is archived; choose an active channel or ask a workspace owner to restore it")
+
+// ErrMessageNotWritable is returned when a user can read a message but cannot
+// mutate it.
+var ErrMessageNotWritable = errors.New("message is not writable")
+
+// ErrDirectConversationNoActivePeer is returned when a sender is the only
+// active workspace member left in a retained direct conversation.
+var ErrDirectConversationNoActivePeer = errors.New("direct conversation has no active recipient")
+
+// ErrPostRateLimited is returned when a waiting-room guest exhausts the small
+// daily post budget.
+var ErrPostRateLimited = errors.New("waiting room post limit reached")
+
+// ErrSlashCommandScopeMismatch is returned when an invocation's supplied
+// workspace does not match the registered command and channel workspaces.
+var ErrSlashCommandScopeMismatch = errors.New("slash command invocation scope does not match command and channel")
+
+// ErrSetupCodeInvalid is returned for any unusable bot setup code — unknown,
+// expired, already claimed, or pointing at a bot that is no longer eligible.
+// The single error keeps claim responses uniform so callers cannot probe
+// which condition failed.
+var ErrSetupCodeInvalid = errors.New("setup code is invalid or expired")
+
+// ErrUploadQuotaExceeded is returned when a user has exhausted their upload
+// budget in a workspace.
+var ErrUploadQuotaExceeded = errors.New("upload quota exceeded")
+
+const (
+	ChannelNotifyAll      = "all"
+	ChannelNotifyMentions = "mentions"
+	ChannelNotifyMuted    = "muted"
+)
+
+var (
+	ErrPushChannelMuted = errors.New("the recipient muted the channel")
+	ErrPushNotMentioned = errors.New("the message does not mention the recipient")
+)
+
+// ChannelPushAllowed is the push policy for a channel message: a recipient who
+// muted the channel gets nothing, one who chose mentions gets only messages
+// that mention them, and everyone else gets every message. Recipient selection
+// applies it when a message is posted, and the web push worker applies it again
+// to the message as it reads when a queued push is sent.
+func ChannelPushAllowed(preference string, mentioned bool) error {
+	switch preference {
+	case ChannelNotifyMuted:
+		return ErrPushChannelMuted
+	case ChannelNotifyMentions:
+		if !mentioned {
+			return ErrPushNotMentioned
+		}
+	}
+	return nil
+}
+
+var (
+	ErrAlreadyPinned         = errors.New("message is already pinned")
+	ErrPinnedMessageNotFound = errors.New("pinned message not found")
+	ErrPinnedMessageLimit    = errors.New("channel pin limit reached (maximum 100)")
+)
+
+const MaxPinnedMessagesPerChannel = 100
+
+// ErrUploadNonceConflict is returned when a client reuses an upload nonce in
+// another workspace.
+var ErrUploadNonceConflict = errors.New("upload nonce was already used in another workspace")
+
+// ErrUploadNonceInProgress is returned while another request owns the same
+// upload nonce claim and has not committed or released it yet.
+var ErrUploadNonceInProgress = errors.New("upload nonce is already in progress")
+
+var (
+	ErrOAuthTransactionInvalid  = errors.New("invalid or expired oauth transaction")
+	ErrOAuthCapacityExceeded    = errors.New("too many pending oauth requests")
+	ErrDesktopOAuthGrantInvalid = errors.New("invalid or expired desktop oauth grant")
+)
+
+// ErrInvalidMessageKind is returned when a caller supplies a message kind that
+// is not one of the recognised values. HTTP callers surface it as a 400.
+var ErrInvalidMessageKind = errors.New("invalid message kind")
+
+// ErrTurnIDNotAllowed is returned when an ordinary ('message') row is created
+// with a non-empty turn_id. turn_id correlates a sequence of agent activity
+// rows belonging to one turn; an ordinary message carrying one contradicts the
+// documented "must be empty for ordinary messages" contract. HTTP callers surface it as
+// a 400 so a client bug fails closed instead of silently persisting a
+// contradictory turn_id.
+var ErrTurnIDNotAllowed = errors.New("turn_id is only valid for agent activity messages")
+
+// Message kinds. 'message' is an ordinary human/bot message and is the default
+// for any row created before this column existed. The agent_* kinds are
+// durable agent activity rows: they ride the normal message stream (channel
+// sequence, message.created fan-out, scrollback) but are excluded from
+// full-text search and from unread/notification accounting.
+const (
+	MessageKindMessage         = "message"
+	MessageKindAgentCommentary = "agent_commentary"
+	MessageKindAgentTool       = "agent_tool"
+)
+
+// AgentActivityWriteScope is the dedicated, non-inherited bot scope required to
+// create an agent activity message (kind != 'message'). It is deliberately
+// EXCLUDED from the bot:* bundles so existing deployments' capability surface
+// is unchanged: a bot must be granted it explicitly.
+const AgentActivityWriteScope = "agent_activity:write"
+
+// BotCommandsWriteScope allows a bot token to replace its bot user's command
+// menu in the token's bound workspace.
+const BotCommandsWriteScope = "commands:write"
+
+// IsActivityMessageKind reports whether kind is one of the durable agent
+// activity kinds (anything other than the ordinary 'message').
+func IsActivityMessageKind(kind string) bool {
+	return kind == MessageKindAgentCommentary || kind == MessageKindAgentTool
+}
+
+// NormalizeMessageKind validates a caller-supplied kind. An empty value
+// defaults to 'message'. Unknown values return ErrInvalidMessageKind.
+func NormalizeMessageKind(kind string) (string, error) {
+	switch kind {
+	case "", MessageKindMessage:
+		return MessageKindMessage, nil
+	case MessageKindAgentCommentary, MessageKindAgentTool:
+		return kind, nil
+	default:
+		return "", ErrInvalidMessageKind
+	}
+}
+
+// ErrNotWorkspaceManager is returned when a workspace operation requires an
+// owner or moderator.
+var ErrNotWorkspaceManager = errors.New("workspace manager permission required")
+
+// ErrNotWorkspaceMember is returned when a workspace operation requires any
+// membership and the caller has none.
+var ErrNotWorkspaceMember = errors.New("workspace membership required")
+
+// ErrWorkspaceOwnerRequired is returned when a workspace operation requires the
+// current owner, not just a moderator.
+var ErrWorkspaceOwnerRequired = errors.New("workspace owner permission required")
+
+// ErrAmbiguousUserEmail is returned when a case-insensitive identity email
+// lookup resolves to more than one user. Callers must use an unambiguous user
+// ID rather than guessing which account should receive access.
+var ErrAmbiguousUserEmail = errors.New("multiple users have this identity email")
+
+// ErrAmbiguousUserIdentifier is returned when a password login identifier
+// matches more than one account. Signing in would have to guess which account
+// the caller meant, so the lookup fails instead.
+var ErrAmbiguousUserIdentifier = errors.New("multiple users match this identifier")
+
+// ErrPasswordVerificationStale is returned when a password operation reaches
+// its commit and finds the stored hash is no longer the one it verified. The
+// expensive key derivation runs outside the transaction, so another change can
+// land in between; the write is refused rather than applied to a credential the
+// caller never proved.
+var ErrPasswordVerificationStale = errors.New("stored password changed while this request was verifying it")
+
+// ErrSessionRevoked is returned when a request that authenticated with a
+// session reaches its commit and finds that session is no longer live. A
+// password change that revoked it must not be overwritten by the request it
+// signed out.
+var ErrSessionRevoked = errors.New("this session is no longer valid")
+
+var ErrSessionExpired = errors.New("session expired")
+
+// ErrBotOwnerRequired is returned when a user-owned bot operation is attempted
+// by someone other than the bot owner.
+var ErrBotOwnerRequired = errors.New("only the bot owner can manage this bot")
+
+// ErrBotOwnerMembershipRequired is returned when a user-owned bot operation is
+// attempted after the owner has lost membership in that workspace.
+var ErrBotOwnerMembershipRequired = errors.New("bot owner must be a workspace member")
+
+// ErrBotOwnerCreateRequired is returned when someone other than the owner tries
+// to create a user-owned bot.
+var ErrBotOwnerCreateRequired = errors.New("only the bot owner can create a user-owned bot")
+
+const (
+	WorkspaceRoleOwner           = "owner"
+	WorkspaceRoleModerator       = "moderator"
+	WorkspaceRoleMember          = "member"
+	WorkspaceRoleGuest           = "guest"
+	WorkspaceRoleBot             = "bot"
+	GuestChannelName             = "guest"
+	GuestPostLimit               = 3
+	MaxDirectConversationMembers = 32
+
+	UploadQuotaBytesPerUserWorkspace int64 = 512 << 20
+	UploadQuotaCountPerUserWorkspace int64 = 64
+)
+
+type User struct {
+	ID                   string                `json:"id"`
+	Kind                 string                `json:"kind"`
+	OwnerUserID          string                `json:"owner_user_id,omitempty"`
+	DisplayName          string                `json:"display_name"`
+	Handle               string                `json:"handle"`
+	FormerHandle         string                `json:"former_handle,omitempty"`
+	AvatarURL            string                `json:"avatar_url"`
+	CreatedAt            string                `json:"created_at"`
+	DeletedAt            *string               `json:"deleted_at,omitempty"`
+	NotificationSettings *NotificationSettings `json:"notification_settings,omitempty"`
+}
+
+type NotificationSettings struct {
+	PushoverEnabled bool   `json:"pushover_enabled"`
+	PushoverUserKey string `json:"pushover_user_key"`
+}
+
+type UpdateNotificationSettingsInput struct {
+	UserID          string
+	PushoverEnabled bool
+	PushoverUserKey string
+}
+
+type AppearancePreferences struct {
+	ColorMode     string `json:"color_mode,omitempty"`
+	BoardTheme    string `json:"board_theme,omitempty"`
+	MessageLayout string `json:"message_layout,omitempty"`
+	Density       string `json:"density,omitempty"`
+}
+
+type AppearancePreferencesPatch struct {
+	ColorMode     *string `json:"color_mode,omitempty"`
+	BoardTheme    *string `json:"board_theme,omitempty"`
+	MessageLayout *string `json:"message_layout,omitempty"`
+	Density       *string `json:"density,omitempty"`
+}
+
+// SidebarPreferences is the caller's complete roaming sidebar snapshot.
+// Workspaces with no saved channel order are absent from the map.
+type SidebarPreferences struct {
+	ChannelOrder map[string][]string `json:"channel_order,omitempty"`
+}
+
+// SidebarPreferencesPatch replaces the channel order of every workspace it
+// lists and leaves the rest untouched. An empty list clears that workspace.
+type SidebarPreferencesPatch struct {
+	ChannelOrder map[string][]string `json:"channel_order,omitempty"`
+}
+
+type ChannelNotificationInput struct {
+	ChannelID  string
+	UserID     string
+	Preference string
+}
+
+type PushNotificationRecipient struct {
+	UserID          string
+	DisplayName     string
+	PushoverUserKey string
+	Subscriptions   []PushSubscriptionTarget
+}
+
+type Workspace struct {
+	ID        string `json:"id"`
+	RouteID   string `json:"route_id"`
+	Name      string `json:"name"`
+	Slug      string `json:"slug"`
+	IconURL   string `json:"icon_url"`
+	CreatedAt string `json:"created_at"`
+	Role      string `json:"role,omitempty"`
+}
+
+type Channel struct {
+	ID              string  `json:"id"`
+	RouteID         string  `json:"route_id"`
+	WorkspaceID     string  `json:"workspace_id"`
+	Name            string  `json:"name"`
+	DisplayTitle    *string `json:"display_title,omitempty"`
+	Kind            string  `json:"kind"`
+	CreatedAt       string  `json:"created_at"`
+	ArchivedAt      *string `json:"archived_at,omitempty"`
+	ExternalManaged bool    `json:"external_managed"`
+	ExternalRef     *string `json:"external_ref,omitempty"`
+	ExternalURL     *string `json:"external_url,omitempty"`
+	SidebarSection  *string `json:"sidebar_section,omitempty"`
+	LastSeq         int64   `json:"last_seq"`
+	LastReadSeq     int64   `json:"last_read_seq"`
+	UnreadCount     int64   `json:"unread_count"`
+}
+
+type ReactionSummary struct {
+	Emoji       string `json:"emoji"`
+	Count       int64  `json:"count"`
+	ReactedByMe bool   `json:"reacted_by_me"`
+}
+
+type PinnedMessage struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	ChannelID   string `json:"channel_id"`
+	MessageID   string `json:"message_id"`
+	PinnedBy    string `json:"pinned_by"`
+	CreatedAt   string `json:"created_at"`
+}
+
+type Message struct {
+	ID                   string  `json:"id"`
+	RouteID              string  `json:"route_id,omitempty"`
+	WorkspaceID          string  `json:"workspace_id"`
+	ChannelID            string  `json:"channel_id,omitempty"`
+	DirectConversationID string  `json:"direct_conversation_id,omitempty"`
+	AuthorID             string  `json:"author_id"`
+	ParentMessageID      *string `json:"parent_message_id,omitempty"`
+	ThreadRootID         string  `json:"thread_root_id"`
+	TopicID              string  `json:"topic_id,omitempty"`
+	ChannelSeq           *int64  `json:"channel_seq,omitempty"`
+	ThreadSeq            *int64  `json:"thread_seq,omitempty"`
+	Body                 string  `json:"body"`
+	BodyFormat           string  `json:"body_format"`
+	CreatedAt            string  `json:"created_at"`
+	EditedAt             *string `json:"edited_at,omitempty"`
+	DeletedAt            *string `json:"deleted_at,omitempty"`
+	// Kind discriminates ordinary messages from durable agent activity rows.
+	// Empty in JSON means the default 'message'.
+	Kind string `json:"kind,omitempty"`
+	// TurnID correlates a sequence of agent activity rows belonging to one
+	// agent turn. It must be empty for ordinary messages (kind="message"): the
+	// create path enforces this and rejects a non-empty turn_id on a 'message'
+	// kind with a 400 ErrTurnIDNotAllowed. It is optional for agent activity
+	// kinds (agent_commentary/agent_tool), which may carry one.
+	TurnID             string       `json:"turn_id,omitempty"`
+	Author             *User        `json:"author,omitempty"`
+	Attachments        []Upload     `json:"attachments,omitempty"`
+	QuotedMessageID    *string      `json:"quoted_message_id,omitempty"`
+	QuotedBodySnapshot string       `json:"quoted_body_snapshot,omitempty"`
+	QuotedAuthorID     *string      `json:"quoted_author_id,omitempty"`
+	QuotedAuthor       *User        `json:"quoted_author,omitempty"`
+	ThreadState        *ThreadState `json:"thread_state,omitempty"`
+	// Nonce is a client-supplied idempotency key used by optimistic UIs to match
+	// the server response to a pending placeholder and safely retry after a lost
+	// response.
+	Nonce     string            `json:"nonce,omitempty"`
+	Reactions []ReactionSummary `json:"reactions,omitempty"`
+}
+
+type MessagePageRequest struct {
+	Limit     int
+	BeforeSeq *int64
+	AfterSeq  *int64
+	AroundSeq *int64
+	TopicID   string
+}
+
+type MessagePage struct {
+	Messages  []Message `json:"messages"`
+	OldestSeq int64     `json:"oldest_seq"`
+	NewestSeq int64     `json:"newest_seq"`
+	HasOlder  bool      `json:"has_older"`
+	HasNewer  bool      `json:"has_newer"`
+}
+
+type ThreadPageRequest struct {
+	MessagePageRequest
+	Latest bool
+}
+
+type ThreadPage struct {
+	Root        Message     `json:"root"`
+	Replies     []Message   `json:"replies"`
+	ThreadState ThreadState `json:"thread_state"`
+	OldestSeq   int64       `json:"oldest_seq"`
+	NewestSeq   int64       `json:"newest_seq"`
+	HasOlder    bool        `json:"has_older"`
+	HasNewer    bool        `json:"has_newer"`
+}
+
+type ThreadState struct {
+	RootMessageID          string   `json:"root_message_id"`
+	ReplyCount             int64    `json:"reply_count"`
+	LastReplyAt            *string  `json:"last_reply_at,omitempty"`
+	LastReplyAuthorIDs     []string `json:"last_reply_author_ids"`
+	LastReplyAuthorIDsJSON string   `json:"-"`
+}
+
+type Event struct {
+	ID               string   `json:"id"`
+	Cursor           string   `json:"cursor"`
+	Type             string   `json:"type"`
+	WorkspaceID      string   `json:"workspace_id"`
+	ChannelID        string   `json:"channel_id,omitempty"`
+	Seq              *int64   `json:"seq,omitempty"`
+	CreatedAt        string   `json:"created_at"`
+	PayloadJSON      string   `json:"-"`
+	Payload          any      `json:"payload"`
+	RecipientUserIDs []string `json:"-"`
+	MentionedUserIDs []string `json:"mentioned_user_ids,omitempty"`
+}
+
+type CreateUserInput struct {
+	DisplayName string
+	Email       string
+}
+
+type AddWorkspaceMemberInput struct {
+	WorkspaceID string
+	UserID      string
+	ActorUserID string
+	Role        string
+}
+
+type AddWorkspaceMemberResult struct {
+	Role  string
+	Added bool
+}
+
+type CreateBotInput struct {
+	WorkspaceID string
+	OwnerUserID string
+	DisplayName string
+	Handle      string
+	AvatarURL   string
+	TokenName   string
+	Scopes      []string
+	SetupNonce  string
+	CreatedBy   string
+	// SkipInitialToken creates the bot without minting a token, for
+	// installs that hand credentials over via a setup code instead.
+	SkipInitialToken bool
+}
+
+type BotToken struct {
+	ID          string   `json:"id"`
+	BotUserID   string   `json:"bot_user_id"`
+	WorkspaceID string   `json:"workspace_id"`
+	OwnerUserID string   `json:"owner_user_id,omitempty"`
+	Name        string   `json:"name"`
+	Scopes      []string `json:"scopes"`
+	CreatedBy   string   `json:"created_by,omitempty"`
+	CreatedAt   string   `json:"created_at"`
+	LastUsedAt  *string  `json:"last_used_at,omitempty"`
+	RevokedAt   *string  `json:"revoked_at,omitempty"`
+	Token       string   `json:"token,omitempty"`
+}
+
+type BotWithTokens struct {
+	Bot    User       `json:"bot"`
+	Tokens []BotToken `json:"tokens"`
+}
+
+type DeletedBot struct {
+	ID           string   `json:"id"`
+	DisplayName  string   `json:"display_name"`
+	FormerHandle string   `json:"former_handle"`
+	DeletedAt    string   `json:"deleted_at"`
+	WorkspaceIDs []string `json:"-"`
+}
+
+type BotCommandInput struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+	ArgsHint    string `json:"args_hint"`
+}
+
+type BotCommand struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	BotUserID   string `json:"bot_user_id"`
+	Command     string `json:"command"`
+	Description string `json:"description"`
+	ArgsHint    string `json:"args_hint"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+type BotCommandBot struct {
+	ID          string `json:"id"`
+	Handle      string `json:"handle"`
+	DisplayName string `json:"display_name"`
+	AvatarURL   string `json:"avatar_url"`
+}
+
+type WorkspaceBotCommand struct {
+	ID          string        `json:"id"`
+	Command     string        `json:"command"`
+	Description string        `json:"description"`
+	ArgsHint    string        `json:"args_hint"`
+	Bot         BotCommandBot `json:"bot"`
+	CreatedAt   string        `json:"created_at"`
+	UpdatedAt   string        `json:"updated_at"`
+}
+
+type OwnedBotWorkspace struct {
+	ID      string `json:"id"`
+	RouteID string `json:"route_id"`
+	Name    string `json:"name"`
+}
+
+type OwnedBotEntry struct {
+	Bot              User              `json:"bot"`
+	Workspace        OwnedBotWorkspace `json:"workspace"`
+	ActiveTokenCount int               `json:"active_token_count"`
+}
+
+type CreateBotTokenInput struct {
+	WorkspaceID string
+	BotUserID   string
+	Name        string
+	Scopes      []string
+	SetupNonce  string
+	CreatedBy   string
+}
+
+// BotSetupCode is a pending bot-token grant. Creating one does not mint a
+// token; the token is minted when the code is claimed. Code carries the
+// plaintext only in the mint response — at rest only the hash is stored.
+type BotSetupCodeDefaults struct {
+	DefaultTo     string   `json:"defaultTo,omitempty"`
+	AllowFrom     []string `json:"allowFrom,omitempty"`
+	AgentActivity *bool    `json:"agentActivity,omitempty"`
+}
+
+type BotSetupCode struct {
+	ID          string               `json:"id"`
+	BotUserID   string               `json:"bot_user_id"`
+	WorkspaceID string               `json:"workspace_id"`
+	TokenName   string               `json:"token_name"`
+	Scopes      []string             `json:"scopes"`
+	Defaults    BotSetupCodeDefaults `json:"defaults"`
+	CreatedBy   string               `json:"created_by,omitempty"`
+	CreatedAt   string               `json:"created_at"`
+	ExpiresAt   string               `json:"expires_at"`
+	Code        string               `json:"code,omitempty"`
+}
+
+type CreateBotSetupCodeInput struct {
+	WorkspaceID string
+	BotUserID   string
+	Name        string
+	Scopes      []string
+	Defaults    BotSetupCodeDefaults
+	CreatedBy   string
+}
+
+// BotSetupCodeClaim is the result of claiming a setup code: the freshly
+// minted token (plaintext included once) plus the context an installer
+// needs to write its configuration.
+type BotSetupCodeClaim struct {
+	BotToken  BotToken             `json:"bot_token"`
+	Bot       User                 `json:"bot"`
+	Workspace Workspace            `json:"workspace"`
+	Defaults  BotSetupCodeDefaults `json:"defaults"`
+}
+
+type AppInstallation struct {
+	ID          string         `json:"id"`
+	WorkspaceID string         `json:"workspace_id"`
+	AppSlug     string         `json:"app_slug"`
+	DisplayName string         `json:"display_name"`
+	BotUserID   string         `json:"bot_user_id"`
+	Config      map[string]any `json:"config"`
+	CreatedBy   string         `json:"created_by,omitempty"`
+	CreatedAt   string         `json:"created_at"`
+	RevokedAt   *string        `json:"revoked_at,omitempty"`
+}
+
+type CreateAppInstallationInput struct {
+	WorkspaceID string
+	AppSlug     string
+	DisplayName string
+	BotUserID   string
+	Config      map[string]any
+	SetupNonce  string
+	CreatedBy   string
+}
+
+type RevokeAppInstallationOptions struct {
+	RevokeSlashCommands      bool
+	RevokeEventSubscriptions bool
+	RevokeBotTokens          bool
+	DeleteBot                bool
+}
+
+type AppInstallationRevokedCounts struct {
+	SlashCommands      int `json:"slash_commands"`
+	EventSubscriptions int `json:"event_subscriptions"`
+	BotTokens          int `json:"bot_tokens"`
+}
+
+type RevokeAppInstallationResult struct {
+	Installation AppInstallation              `json:"installation"`
+	Revoked      AppInstallationRevokedCounts `json:"revoked"`
+	DeletedBot   *DeletedBot                  `json:"deleted_bot,omitempty"`
+}
+
+type SlashCommand struct {
+	ID                string  `json:"id"`
+	WorkspaceID       string  `json:"workspace_id"`
+	AppInstallationID string  `json:"app_installation_id,omitempty"`
+	Command           string  `json:"command"`
+	Description       string  `json:"description"`
+	CallbackURL       string  `json:"callback_url"`
+	SigningSecret     string  `json:"signing_secret,omitempty"`
+	BotUserID         string  `json:"bot_user_id"`
+	CreatedBy         string  `json:"created_by,omitempty"`
+	CreatedAt         string  `json:"created_at"`
+	RevokedAt         *string `json:"revoked_at,omitempty"`
+}
+
+type CreateSlashCommandInput struct {
+	WorkspaceID       string
+	AppInstallationID string
+	Command           string
+	Description       string
+	CallbackURL       string
+	BotUserID         string
+	CreatedBy         string
+}
+
+type SlashCommandInvocation struct {
+	ID             string  `json:"id"`
+	CommandID      string  `json:"command_id"`
+	WorkspaceID    string  `json:"workspace_id"`
+	ChannelID      string  `json:"channel_id"`
+	UserID         string  `json:"user_id"`
+	Text           string  `json:"text"`
+	PayloadJSON    string  `json:"payload_json,omitempty"`
+	ResponseStatus int     `json:"response_status"`
+	ResponseBody   string  `json:"response_body,omitempty"`
+	Error          string  `json:"error,omitempty"`
+	CreatedAt      string  `json:"created_at"`
+	CompletedAt    *string `json:"completed_at,omitempty"`
+}
+
+type CreateSlashCommandInvocationInput struct {
+	CommandID   string
+	WorkspaceID string
+	ChannelID   string
+	UserID      string
+	Text        string
+	PayloadJSON string
+}
+
+type EventSubscription struct {
+	ID                string   `json:"id"`
+	WorkspaceID       string   `json:"workspace_id"`
+	AppInstallationID string   `json:"app_installation_id,omitempty"`
+	EventTypes        []string `json:"event_types"`
+	CallbackURL       string   `json:"callback_url"`
+	SigningSecret     string   `json:"signing_secret,omitempty"`
+	CreatedBy         string   `json:"created_by,omitempty"`
+	CreatedAt         string   `json:"created_at"`
+	RevokedAt         *string  `json:"revoked_at,omitempty"`
+}
+
+type CreateEventSubscriptionInput struct {
+	WorkspaceID       string
+	AppInstallationID string
+	EventTypes        []string
+	CallbackURL       string
+	CreatedBy         string
+}
+
+type EventDeliveryAttempt struct {
+	ID             string `json:"id"`
+	SubscriptionID string `json:"subscription_id"`
+	EventID        string `json:"event_id"`
+	WorkspaceID    string `json:"workspace_id"`
+	EventType      string `json:"event_type"`
+	Attempt        int    `json:"attempt"`
+	RequestJSON    string `json:"request_json,omitempty"`
+	ResponseStatus int    `json:"response_status"`
+	ResponseBody   string `json:"response_body,omitempty"`
+	Error          string `json:"error,omitempty"`
+	CreatedAt      string `json:"created_at"`
+	CompletedAt    string `json:"completed_at"`
+}
+
+type CreateEventDeliveryAttemptInput struct {
+	SubscriptionID string
+	EventID        string
+	WorkspaceID    string
+	EventType      string
+	RequestJSON    string
+	ResponseStatus int
+	ResponseBody   string
+	Error          string
+}
+
+type AuditLogEntry struct {
+	ID          string         `json:"id"`
+	WorkspaceID string         `json:"workspace_id"`
+	ActorUserID string         `json:"actor_user_id"`
+	Action      string         `json:"action"`
+	TargetType  string         `json:"target_type"`
+	TargetID    string         `json:"target_id"`
+	Metadata    map[string]any `json:"metadata"`
+	CreatedAt   string         `json:"created_at"`
+}
+
+type CreateAuditLogEntryInput struct {
+	WorkspaceID string
+	ActorUserID string
+	Action      string
+	TargetType  string
+	TargetID    string
+	Metadata    map[string]any
+}
+
+type ConnectedAccount struct {
+	ID                string         `json:"id"`
+	WorkspaceID       string         `json:"workspace_id"`
+	UserID            string         `json:"user_id"`
+	Provider          string         `json:"provider"`
+	ProviderAccountID string         `json:"provider_account_id"`
+	DisplayName       string         `json:"display_name"`
+	Scopes            []string       `json:"scopes"`
+	Metadata          map[string]any `json:"metadata"`
+	CreatedAt         string         `json:"created_at"`
+	RevokedAt         *string        `json:"revoked_at,omitempty"`
+}
+
+type CreateConnectedAccountInput struct {
+	WorkspaceID       string
+	UserID            string
+	Provider          string
+	ProviderAccountID string
+	DisplayName       string
+	Scopes            []string
+	Metadata          map[string]any
+	CreatedBy         string
+}
+
+type BotTokenAuth struct {
+	User        User
+	TokenID     string
+	WorkspaceID string
+	Scopes      []string
+}
+
+// ParseMessageMentions returns unique, normalized handles referenced with an
+// @ at a token boundary. Email addresses and Markdown link labels are ignored.
+func ParseMessageMentions(body string) []string {
+	seen := make(map[string]struct{})
+	mentions := make([]string, 0)
+	for i := 0; i < len(body); i++ {
+		if hasHTTPURLPrefix(body[i:]) {
+			for i < len(body) && body[i] != ' ' && body[i] != '\n' && body[i] != '\r' && body[i] != '\t' {
+				i++
+			}
+			i--
+			continue
+		}
+		if body[i] == '[' {
+			if linkEnd := markdownLinkEnd(body, i); linkEnd >= 0 {
+				i = linkEnd
+				continue
+			}
+		}
+		if body[i] != '@' || (i > 0 && !isMentionBoundary(body[i-1])) {
+			continue
+		}
+		j := i + 1
+		for j < len(body) && isMentionChar(body[j]) {
+			j++
+		}
+		if j == i+1 {
+			continue
+		}
+		handle := strings.ToLower(body[i+1 : j])
+		if _, exists := seen[handle]; exists {
+			continue
+		}
+		seen[handle] = struct{}{}
+		mentions = append(mentions, handle)
+		i = j - 1
+	}
+	return mentions
+}
+
+func hasHTTPURLPrefix(value string) bool {
+	return hasURLLikePrefix(value)
+}
+
+func hasURLLikePrefix(value string) bool {
+	if len(value) >= len("www.") && strings.EqualFold(value[:len("www.")], "www.") {
+		return true
+	}
+	separator := strings.Index(value, "://")
+	if separator <= 0 {
+		return false
+	}
+	for i := range separator {
+		char := value[i]
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			(char >= '0' && char <= '9' && i > 0) || char == '+' || char == '-' || char == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func markdownLinkEnd(body string, labelStart int) int {
+	labelEndOffset := strings.IndexByte(body[labelStart+1:], ']')
+	if labelEndOffset < 0 {
+		return -1
+	}
+	labelEnd := labelStart + 1 + labelEndOffset
+	if labelEnd+1 >= len(body) || body[labelEnd+1] != '(' {
+		return -1
+	}
+	targetStart := labelEnd + 2
+	targetEndOffset := strings.IndexByte(body[targetStart:], ')')
+	if targetEndOffset < 0 {
+		return -1
+	}
+	return targetStart + targetEndOffset
+}
+
+func isMentionBoundary(char byte) bool {
+	return !isMentionChar(char) && char != '@'
+}
+
+func isMentionChar(char byte) bool {
+	return char >= 'a' && char <= 'z' ||
+		char >= 'A' && char <= 'Z' ||
+		char >= '0' && char <= '9' ||
+		char == '_' || char == '-'
+}
+
+type UpsertIdentityUserInput struct {
+	Provider        string
+	ProviderSubject string
+	Email           string
+	DisplayName     string
+	AvatarURL       string
+}
+
+type UpdateUserProfileInput struct {
+	UserID      string
+	DisplayName string
+	Handle      string
+	AvatarURL   string
+}
+
+type UpdateCurrentUserInput struct {
+	UserID                string
+	DisplayName           *string
+	Handle                *string
+	AvatarURL             *string
+	NotificationSettings  *NotificationSettings
+	AppearancePreferences *AppearancePreferencesPatch
+	SidebarPreferences    *SidebarPreferencesPatch
+}
+
+type CurrentUserState struct {
+	User                  User
+	AppearancePreferences *AppearancePreferences
+	SidebarPreferences    *SidebarPreferences
+}
+
+type CreateWorkspaceInput struct {
+	Name string
+	Slug string
+}
+
+type UpdateWorkspaceInput struct {
+	WorkspaceID string
+	ActorUserID string
+	Name        *string
+	Slug        *string
+	IconURL     *string
+}
+
+type TransferWorkspaceOwnershipInput struct {
+	WorkspaceID    string
+	ActorUserID    string
+	NewOwnerUserID string
+}
+
+type CreateChannelInput struct {
+	WorkspaceID     string
+	Name            string
+	DisplayTitle    string
+	Kind            string
+	UserID          string
+	ExternalManaged bool
+	ExternalRef     string
+	ExternalURL     string
+	SidebarSection  string
+}
+
+type UpdateChannelInput struct {
+	ChannelID       string
+	UserID          string
+	Name            string
+	DisplayTitle    *string
+	Kind            string
+	Archived        *bool
+	ExternalManaged *bool
+	ExternalRef     *string
+	ExternalURL     *string
+	SidebarSection  *string
+}
+
+type CreateMessageInput struct {
+	ChannelID       string
+	AuthorID        string
+	Body            string
+	QuotedMessageID *string
+	Nonce           string
+	TopicID         string
+	UploadID        string
+	// Kind defaults to 'message' when empty. Activity kinds are gated at the
+	// API layer by AgentActivityWriteScope.
+	Kind   string
+	TurnID string
+}
+
+type UpdateMessageInput struct {
+	MessageID string
+	UserID    string
+	Body      string
+}
+
+type DeleteMessageInput struct {
+	MessageID string
+	UserID    string
+}
+
+type CreateThreadReplyInput struct {
+	RootMessageID   string
+	AuthorID        string
+	Body            string
+	QuotedMessageID *string
+	Nonce           string
+}
+
+type CreateReactionInput struct {
+	MessageID string
+	UserID    string
+	Emoji     string
+}
+
+type Upload struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	OwnerID     string `json:"owner_id"`
+	Nonce       string `json:"nonce,omitempty"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type"`
+	ByteSize    int64  `json:"byte_size"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
+	DurationMS  int    `json:"duration_ms"`
+	StoragePath string `json:"-"`
+	CreatedAt   string `json:"created_at"`
+}
+
+type PendingUploadCleanup struct {
+	ID          string `json:"id"`
+	WorkspaceID string `json:"workspace_id"`
+	StoragePath string `json:"storage_path"`
+	Attempts    int64  `json:"attempts"`
+	LastError   string `json:"last_error"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+}
+
+type CreateUploadInput struct {
+	WorkspaceID string
+	OwnerID     string
+	Nonce       string
+	Filename    string
+	ContentType string
+	ByteSize    int64
+	Width       int
+	Height      int
+	DurationMS  int
+	StoragePath string
+}
+
+type UploadQuota struct {
+	MaxBytes       int64
+	UsedBytes      int64
+	RemainingBytes int64
+	MaxCount       int64
+	UsedCount      int64
+	RemainingCount int64
+}
+
+func (q UploadQuota) CanFit(byteSize int64) error {
+	if q.RemainingCount <= 0 || byteSize > q.RemainingBytes {
+		return ErrUploadQuotaExceeded
+	}
+	return nil
+}
+
+type UploadQuotaReservation struct {
+	ID          string
+	WorkspaceID string
+	OwnerID     string
+	Nonce       string
+	ByteSize    int64
+	CreatedAt   string
+	ExpiresAt   string
+}
+
+type AttachUploadInput struct {
+	MessageID string
+	UploadID  string
+	UserID    string
+}
+
+type SearchHighlight struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+type SearchAuthor struct {
+	ID           string  `json:"id"`
+	Kind         string  `json:"kind"`
+	OwnerUserID  string  `json:"owner_user_id,omitempty"`
+	DisplayName  string  `json:"display_name"`
+	Handle       string  `json:"handle"`
+	FormerHandle string  `json:"former_handle,omitempty"`
+	AvatarURL    string  `json:"avatar_url"`
+	CreatedAt    string  `json:"created_at"`
+	DeletedAt    *string `json:"deleted_at,omitempty"`
+}
+
+type SearchHit struct {
+	ID                   string            `json:"id"`
+	WorkspaceID          string            `json:"workspace_id"`
+	ChannelID            string            `json:"channel_id,omitempty"`
+	ChannelName          string            `json:"channel_name,omitempty"`
+	DirectConversationID string            `json:"direct_conversation_id,omitempty"`
+	Author               SearchAuthor      `json:"author"`
+	ParentMessageID      *string           `json:"parent_message_id,omitempty"`
+	ThreadRootID         string            `json:"thread_root_id"`
+	ChannelSeq           *int64            `json:"channel_seq,omitempty"`
+	ThreadSeq            *int64            `json:"thread_seq,omitempty"`
+	CreatedAt            string            `json:"created_at"`
+	EditedAt             *string           `json:"edited_at,omitempty"`
+	ReplyCount           int               `json:"reply_count"`
+	LastReplyAt          *string           `json:"last_reply_at,omitempty"`
+	Snippet              string            `json:"snippet"`
+	Highlights           []SearchHighlight `json:"highlights"`
+}
+
+type SearchPage struct {
+	Results    []SearchHit `json:"results"`
+	NextCursor *string     `json:"next_cursor"`
+}
+
+type DirectConversation struct {
+	ID          string `json:"id"`
+	RouteID     string `json:"route_id"`
+	WorkspaceID string `json:"workspace_id"`
+	CreatedAt   string `json:"created_at"`
+	Members     []User `json:"members"`
+	LastSeq     int64  `json:"last_seq"`
+	LastReadSeq int64  `json:"last_read_seq"`
+	UnreadCount int64  `json:"unread_count"`
+	CanSend     bool   `json:"can_send"`
+}
+
+type CreateDirectConversationInput struct {
+	WorkspaceID string
+	UserID      string
+	MemberIDs   []string
+}
+
+type CreateDirectMessageInput struct {
+	ConversationID  string
+	AuthorID        string
+	Body            string
+	QuotedMessageID *string
+	Nonce           string
+	UploadID        string
+	Kind            string
+	TurnID          string
+}
+
+type Topic struct {
+	ID          string  `json:"id"`
+	WorkspaceID string  `json:"workspace_id"`
+	ChannelID   string  `json:"channel_id,omitempty"`
+	Name        string  `json:"name"`
+	CreatedBy   string  `json:"created_by,omitempty"`
+	CreatedAt   string  `json:"created_at"`
+	ArchivedAt  *string `json:"archived_at,omitempty"`
+}
+
+type CreateTopicInput struct {
+	WorkspaceID string
+	ChannelID   string
+	Name        string
+	CreatedBy   string
+}
+
+type Invite struct {
+	ID          string  `json:"id"`
+	WorkspaceID string  `json:"workspace_id"`
+	Token       string  `json:"token"`
+	CreatedBy   string  `json:"created_by"`
+	CreatedAt   string  `json:"created_at"`
+	AcceptedAt  *string `json:"accepted_at,omitempty"`
+}
+
+type MagicLink struct {
+	ID          string  `json:"id"`
+	Token       string  `json:"token"`
+	Email       string  `json:"email"`
+	DisplayName string  `json:"display_name"`
+	CreatedAt   string  `json:"created_at"`
+	ExpiresAt   string  `json:"expires_at"`
+	UsedAt      *string `json:"used_at,omitempty"`
+}
+
+type Session struct {
+	ID        string `json:"id"`
+	Token     string `json:"token"`
+	UserID    string `json:"user_id"`
+	CreatedAt string `json:"created_at"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// PasswordLogin carries the account a password identifier resolved to together
+// with its stored hash. PasswordHash is empty when the account exists but has
+// no password set, which callers must reject the same way they reject a wrong
+// password so the response does not disclose which accounts are enrolled.
+type PasswordLogin struct {
+	User         User
+	PasswordHash string
+}
+
+// ChangeUserPasswordInput describes one password rotation. VerifiedHash is the
+// stored hash the caller checked the current password against, and the store
+// commits nothing unless that is still the hash on file. KeepSessionToken is
+// the caller's own session token: the account's other sessions are revoked, and
+// the write is refused if that session has itself been revoked in the meantime.
+// An empty KeepSessionToken belongs to a caller the server cannot place in a
+// session, such as a trusted-proxy assertion, and revokes every session.
+type ChangeUserPasswordInput struct {
+	UserID           string
+	VerifiedHash     string
+	NewHash          string
+	KeepSessionToken string
+}
+
+const (
+	OAuthModeBrowser = "browser"
+	OAuthModeDesktop = "desktop"
+)
+
+type OAuthTransaction struct {
+	ID                 string
+	StateHash          string
+	BrowserBindingHash string
+	Mode               string
+	PKCEVerifier       string
+	DesktopChallenge   string
+	DesktopProtocol    int64
+	CreatedAt          time.Time
+	ExpiresAt          time.Time
+}
+
+type DesktopOAuthGrant struct {
+	ID               string
+	GrantHash        string
+	UserID           string
+	DesktopChallenge string
+	CreatedAt        time.Time
+	ExpiresAt        time.Time
+}
+
+type ReadReceipt struct {
+	ScopeID     string `json:"scope_id"`
+	UserID      string `json:"user_id"`
+	LastReadSeq int64  `json:"last_read_seq"`
+	LastReadAt  string `json:"last_read_at"`
+}
+
+type RouteTarget struct {
+	WorkspaceID      string `json:"workspace_id"`
+	WorkspaceRouteID string `json:"workspace_route_id"`
+	TargetType       string `json:"target_type"`
+	TargetID         string `json:"target_id"`
+	TargetRouteID    string `json:"target_route_id"`
+	ParentType       string `json:"parent_type,omitempty"`
+	ParentID         string `json:"parent_id,omitempty"`
+	ParentRouteID    string `json:"parent_route_id,omitempty"`
+	CanonicalPath    string `json:"canonical_path"`
+}
+
+type MemberModeration struct {
+	WorkspaceID    string  `json:"workspace_id"`
+	User           User    `json:"user"`
+	Role           string  `json:"role"`
+	PostsRemaining int     `json:"posts_remaining"`
+	PostLimit      int     `json:"post_limit"`
+	TimeoutUntil   *string `json:"timeout_until,omitempty"`
+	BlockedAt      *string `json:"blocked_at,omitempty"`
+	ModerationNote string  `json:"moderation_note,omitempty"`
+	ModerationBy   string  `json:"moderation_by,omitempty"`
+	ModerationAt   string  `json:"moderation_at,omitempty"`
+}
+
+type UpdateMemberModerationInput struct {
+	WorkspaceID    string
+	TargetUserID   string
+	ActorUserID    string
+	Role           string
+	TimeoutUntil   *string
+	ClearTimeout   bool
+	Blocked        *bool
+	ModerationNote *string
+}
+
+type Store interface {
+	Close() error
+	Ping(ctx context.Context) error
+	Migrate(ctx context.Context) error
+	EnsureBootstrap(ctx context.Context, name, email string) (User, error)
+	CreateUser(ctx context.Context, input CreateUserInput) (User, error)
+	CreateBot(ctx context.Context, input CreateBotInput) (User, BotToken, error)
+	ListBots(ctx context.Context, workspaceID, requesterID string) ([]BotWithTokens, error)
+	CreateBotToken(ctx context.Context, input CreateBotTokenInput) (BotToken, error)
+	CreateBotSetupCode(ctx context.Context, input CreateBotSetupCodeInput) (BotSetupCode, error)
+	ClaimBotSetupCode(ctx context.Context, code string) (BotSetupCodeClaim, error)
+	ListBotTokens(ctx context.Context, botUserID, requesterID string) ([]BotToken, error)
+	ListBotTokensForWorkspace(ctx context.Context, workspaceID, botUserID, requesterID string) ([]BotToken, error)
+	RevokeBotToken(ctx context.Context, tokenID, requesterID string) (BotToken, error)
+	RemoveBotFromWorkspace(ctx context.Context, workspaceID, botUserID, requesterID string) error
+	DeleteBot(ctx context.Context, botUserID, requesterID string) (DeletedBot, error)
+	ListBotsOwnedBy(ctx context.Context, ownerUserID string) ([]OwnedBotEntry, error)
+	SetBotCommands(ctx context.Context, workspaceID, botUserID string, commands []BotCommandInput) ([]BotCommand, error)
+	ListBotCommands(ctx context.Context, workspaceID, requesterID string) ([]WorkspaceBotCommand, error)
+	ListAppInstallations(ctx context.Context, workspaceID, requesterID string) ([]AppInstallation, error)
+	CreateAppInstallation(ctx context.Context, input CreateAppInstallationInput) (AppInstallation, error)
+	RevokeAppInstallation(ctx context.Context, installationID, requesterID string, options RevokeAppInstallationOptions) (RevokeAppInstallationResult, error)
+	ListSlashCommands(ctx context.Context, workspaceID, requesterID string) ([]SlashCommand, error)
+	CreateSlashCommand(ctx context.Context, input CreateSlashCommandInput) (SlashCommand, error)
+	RevokeSlashCommand(ctx context.Context, commandID, requesterID string) (SlashCommand, error)
+	RotateSlashCommandSecret(ctx context.Context, commandID, requesterID string) (SlashCommand, error)
+	GetSlashCommandForChannel(ctx context.Context, channelID, command, requesterID string) (SlashCommand, error)
+	CreateSlashCommandInvocation(ctx context.Context, input CreateSlashCommandInvocationInput) (SlashCommandInvocation, error)
+	CompleteSlashCommandInvocation(ctx context.Context, invocationID string, status int, responseBody, invokeError string) (SlashCommandInvocation, error)
+	ListEventSubscriptions(ctx context.Context, workspaceID, requesterID string) ([]EventSubscription, error)
+	CreateEventSubscription(ctx context.Context, input CreateEventSubscriptionInput) (EventSubscription, error)
+	RevokeEventSubscription(ctx context.Context, subscriptionID, requesterID string) (EventSubscription, error)
+	RotateEventSubscriptionSecret(ctx context.Context, subscriptionID, requesterID string) (EventSubscription, error)
+	ListEventSubscriptionsForEvent(ctx context.Context, event Event) ([]EventSubscription, error)
+	CreateEventDeliveryAttempt(ctx context.Context, input CreateEventDeliveryAttemptInput) (EventDeliveryAttempt, error)
+	ListEventDeliveryAttempts(ctx context.Context, subscriptionID, requesterID string, limit int, before string) ([]EventDeliveryAttempt, error)
+	CreateAuditLogEntry(ctx context.Context, input CreateAuditLogEntryInput) (AuditLogEntry, error)
+	ListAuditLogEntries(ctx context.Context, workspaceID, requesterID string, limit int) ([]AuditLogEntry, error)
+	ListConnectedAccounts(ctx context.Context, workspaceID, requesterID string) ([]ConnectedAccount, error)
+	CreateConnectedAccount(ctx context.Context, input CreateConnectedAccountInput) (ConnectedAccount, error)
+	RevokeConnectedAccount(ctx context.Context, accountID, requesterID string) (ConnectedAccount, error)
+	UpsertIdentityUser(ctx context.Context, input UpsertIdentityUserInput) (User, error)
+	UpdateUserProfile(ctx context.Context, input UpdateUserProfileInput) (User, error)
+	UpdateCurrentUser(ctx context.Context, input UpdateCurrentUserInput) (CurrentUserState, error)
+	GetAppearancePreferences(ctx context.Context, userID string) (*AppearancePreferences, error)
+	GetSidebarPreferences(ctx context.Context, userID string) (*SidebarPreferences, error)
+	ListPushNotificationRecipients(ctx context.Context, messageID string, mentionedUserIDs []string) ([]PushNotificationRecipient, error)
+	ListMentionedUserIDs(ctx context.Context, workspaceID, body string) ([]string, error)
+	UpsertPushSubscription(ctx context.Context, input PushSubscriptionInput) (PushSubscription, error)
+	ListPushSubscriptions(ctx context.Context, userID string) ([]PushSubscription, error)
+	DeletePushSubscription(ctx context.Context, userID, endpoint string) error
+	GetPushSubscriptionDelivery(ctx context.Context, userID, endpoint, currentKeyID string) (PushSubscriptionTarget, error)
+	MarkPushSubscriptionSuccess(ctx context.Context, userID, endpoint string) error
+	MarkPushSubscriptionFailure(ctx context.Context, userID, endpoint string, retryAfter time.Duration) (int64, error)
+	PrunePushSubscriptions(ctx context.Context, currentKeyID string, now time.Time) (PushPruneResult, error)
+	UpsertChannelNotificationSettings(ctx context.Context, input ChannelNotificationInput) error
+	GetChannelNotificationPreference(ctx context.Context, channelID, userID string) (string, error)
+	AddWorkspaceMember(ctx context.Context, workspaceID, userID, role string) error
+	AddWorkspaceMemberByActor(ctx context.Context, input AddWorkspaceMemberInput) (AddWorkspaceMemberResult, error)
+	EnsureDefaultWorkspaceMember(ctx context.Context, userID string) (Workspace, error)
+	EnsureDefaultGuestWorkspaceMember(ctx context.Context, userID, role string) (Workspace, error)
+	ListWorkspaceMemberPage(ctx context.Context, workspaceID, actorUserID string, page WorkspaceMemberPageRequest) (WorkspaceMemberPage, error)
+	ListWorkspaceMembers(ctx context.Context, workspaceID, actorUserID string) ([]MemberModeration, error)
+	UpdateMemberModeration(ctx context.Context, input UpdateMemberModerationInput) (MemberModeration, Event, error)
+	UserHasNonGuestMembership(ctx context.Context, userID string) (bool, error)
+	UploadQuota(ctx context.Context, workspaceID, userID string) (UploadQuota, error)
+	ReserveUploadQuota(ctx context.Context, workspaceID, userID, nonce string, byteSize int64) (UploadQuotaReservation, error)
+	CreateReservedUpload(ctx context.Context, reservationID string, input CreateUploadInput) (Upload, error)
+	ReleaseUploadQuotaReservation(ctx context.Context, reservationID, userID string) error
+	FirstUser(ctx context.Context) (User, error)
+	GetUser(ctx context.Context, id string) (User, error)
+	GetUserByEmail(ctx context.Context, email string) (User, error)
+	ListWorkspaces(ctx context.Context, userID string) ([]Workspace, error)
+	CreateWorkspace(ctx context.Context, input CreateWorkspaceInput, ownerID string) (Workspace, error)
+	GetWorkspace(ctx context.Context, workspaceID, userID string) (Workspace, error)
+	UpdateWorkspace(ctx context.Context, input UpdateWorkspaceInput) (Workspace, Event, error)
+	TransferWorkspaceOwnership(ctx context.Context, input TransferWorkspaceOwnershipInput) (Workspace, Event, error)
+	DeleteWorkspace(ctx context.Context, workspaceID, actorUserID string) ([]PendingUploadCleanup, error)
+	ListPendingUploadCleanups(ctx context.Context, limit int) ([]PendingUploadCleanup, error)
+	DeletePendingUploadCleanup(ctx context.Context, cleanupID string) error
+	RecordPendingUploadCleanupFailure(ctx context.Context, cleanupID, message string) error
+	CanPublishEphemeral(ctx context.Context, workspaceID, channelID, directConversationID, userID string) error
+	ResolveRouteTarget(ctx context.Context, userID, workspaceRouteID, targetRouteID string) (RouteTarget, error)
+	ResolveLegacyRouteTarget(ctx context.Context, userID, workspaceID, targetID string) (RouteTarget, error)
+	ListChannels(ctx context.Context, workspaceID, userID string) ([]Channel, error)
+	GetChannel(ctx context.Context, channelID, userID string) (Channel, error)
+	CreateChannel(ctx context.Context, input CreateChannelInput) (Channel, Event, error)
+	UpdateChannel(ctx context.Context, input UpdateChannelInput) (Channel, Event, error)
+	ListTopics(ctx context.Context, workspaceID, requesterID string) ([]Topic, error)
+	CreateTopic(ctx context.Context, input CreateTopicInput) (Topic, error)
+	ListMessages(ctx context.Context, channelID, userID string, page MessagePageRequest) (MessagePage, error)
+	GetMessage(ctx context.Context, messageID, userID string) (Message, error)
+	GetMessageByNonce(ctx context.Context, authorID, nonce string) (Message, error)
+	EnsureMessageRouteID(ctx context.Context, userID, rootMessageID string) (Message, error)
+	EnsureThreadRouteID(ctx context.Context, userID, rootMessageID string) (Message, error)
+	CreateMessage(ctx context.Context, input CreateMessageInput) (Message, Event, error)
+	UpdateMessage(ctx context.Context, input UpdateMessageInput) (Message, Event, error)
+	DeleteMessage(ctx context.Context, input DeleteMessageInput) (Message, []Event, error)
+	GetThreadPage(ctx context.Context, rootMessageID, userID string, req ThreadPageRequest) (ThreadPage, error)
+	CreateThreadReply(ctx context.Context, input CreateThreadReplyInput) (Message, ThreadState, []Event, error)
+	AddReaction(ctx context.Context, input CreateReactionInput) (Event, error)
+	RemoveReaction(ctx context.Context, input CreateReactionInput) (Event, error)
+	PinMessage(ctx context.Context, channelID, messageID, userID string) (PinnedMessage, Event, error)
+	UnpinMessage(ctx context.Context, channelID, messageID, userID string) (Event, error)
+	ListPinnedMessages(ctx context.Context, channelID, userID string, limit int) ([]Message, error)
+	LatestEventCursor(ctx context.Context, workspaceID, userID string) (string, error)
+	EventCursorExists(ctx context.Context, workspaceID, userID, cursor string) (bool, error)
+	ListEventsAfter(ctx context.Context, workspaceID, userID, cursor string, limit int) ([]Event, error)
+	GetUpload(ctx context.Context, uploadID, userID string) (Upload, error)
+	GetUploadByNonce(ctx context.Context, ownerID, nonce string) (Upload, error)
+	UploadHasDirectMessageAttachment(ctx context.Context, uploadID string) (bool, error)
+	UploadHasOtherDirectMessageAttachment(ctx context.Context, uploadID, messageID string) (bool, error)
+	AttachUpload(ctx context.Context, input AttachUploadInput) (Event, error)
+	SearchMessagePage(ctx context.Context, page SearchPageRequest) (SearchPage, error)
+	ListDirectConversations(ctx context.Context, workspaceID, userID string) ([]DirectConversation, error)
+	GetDirectConversation(ctx context.Context, conversationID, userID string) (DirectConversation, error)
+	CreateDirectConversation(ctx context.Context, input CreateDirectConversationInput) (DirectConversation, error)
+	HideDirectConversation(ctx context.Context, conversationID, userID string) error
+	ReopenDirectConversation(ctx context.Context, conversationID, userID string) (DirectConversation, error)
+	ListDirectMessages(ctx context.Context, conversationID, userID string, page MessagePageRequest) (MessagePage, error)
+	CreateDirectMessage(ctx context.Context, input CreateDirectMessageInput) (Message, Event, error)
+	MarkChannelRead(ctx context.Context, channelID, userID string, seq int64) (ReadReceipt, Event, error)
+	MarkDirectRead(ctx context.Context, conversationID, userID string, seq int64) (ReadReceipt, Event, error)
+	CreateInvite(ctx context.Context, workspaceID, createdBy string) (Invite, error)
+	CreateMagicLink(ctx context.Context, email, displayName string) (MagicLink, error)
+	ConsumeMagicLink(ctx context.Context, token string) (User, Session, error)
+	GetOrCreateUserByEmail(ctx context.Context, provider, email, displayName string) (User, error)
+	CreateSession(ctx context.Context, userID string) (Session, error)
+	GetSessionUser(ctx context.Context, token string) (User, error)
+	RevokeSession(ctx context.Context, token string) error
+	GetPasswordLogin(ctx context.Context, identifier string) (PasswordLogin, error)
+	CreateSessionForVerifiedPassword(ctx context.Context, userID, verifiedHash string) (Session, error)
+	GetUserPasswordHash(ctx context.Context, userID string) (string, error)
+	SetUserPassword(ctx context.Context, userID, passwordHash string) error
+	ChangeUserPassword(ctx context.Context, input ChangeUserPasswordInput) (int64, error)
+	ClearUserPassword(ctx context.Context, userID string) error
+	CreateOAuthTransaction(ctx context.Context, transaction OAuthTransaction) error
+	ConsumeOAuthTransaction(ctx context.Context, stateHash, browserBindingHash string, now time.Time) (OAuthTransaction, error)
+	CreateDesktopOAuthGrant(ctx context.Context, grant DesktopOAuthGrant) error
+	ConsumeDesktopOAuthGrant(ctx context.Context, grantHash, desktopChallenge string, now time.Time) (Session, error)
+	GetBotTokenAuth(ctx context.Context, token string) (BotTokenAuth, error)
+	RecordBotTokenUse(ctx context.Context, tokenID string) error
+}

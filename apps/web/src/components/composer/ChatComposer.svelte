@@ -1,0 +1,394 @@
+<script lang="ts">
+  import { tick } from "svelte";
+  import { autoGrow } from "../../lib/actions/autogrow";
+  import { avatarInitial, handleLabel } from "../../lib/chat/people";
+  import { formatBytes, isImageUpload, uploadURL } from "../../lib/uploads";
+  import { gifLibrary } from "../../lib/gifs";
+  import type { Message, SlashCommand, Upload, User, WorkspaceBotCommand } from "../../lib/types";
+  import ComposerToolbar from "./ComposerToolbar.svelte";
+  import GifPicker from "./GifPicker.svelte";
+  import ReplyPreview from "./ReplyPreview.svelte";
+
+  type ActiveToken = {
+    kind: "slash" | "mention";
+    start: number;
+    end: number;
+    query: string;
+    raw: string;
+  };
+
+  type ComposerSuggestion = {
+    id: string;
+    kind: "slash" | "mention";
+    label: string;
+    detail: string;
+    insertText: string;
+    sortText: string;
+    hint?: string;
+    source?: string;
+  };
+
+  type Props = {
+    value: string;
+    placeholder: string;
+    ariaLabel: string;
+    submitLabel: string;
+    formClass?: string;
+    pendingUpload?: Upload | null;
+    replyTarget?: Message | null;
+    showUpload?: boolean;
+    showToolbar?: boolean;
+    slashCommands?: SlashCommand[];
+    botCommands?: WorkspaceBotCommand[];
+    mentionPeople?: User[];
+    disabled?: boolean;
+    onValue: (value: string) => void;
+    onSubmit: () => void;
+    onKeydown: (event: KeyboardEvent) => void;
+    onFocus: () => void;
+    onInputRef: (node: HTMLTextAreaElement | null) => void;
+    onUploadFile?: (event: Event) => void;
+    onRemoveUpload?: () => void;
+    onClearReply?: () => void;
+  };
+
+  let {
+    value,
+    placeholder,
+    ariaLabel,
+    submitLabel,
+    formClass = "composer",
+    pendingUpload = null,
+    replyTarget = null,
+    showUpload = false,
+    showToolbar = false,
+    slashCommands = [],
+    botCommands = [],
+    mentionPeople = [],
+    disabled = false,
+    onValue,
+    onSubmit,
+    onKeydown,
+    onFocus,
+    onInputRef,
+    onUploadFile = () => {},
+    onRemoveUpload = () => {},
+    onClearReply = () => {},
+  }: Props = $props();
+
+  let input: HTMLTextAreaElement | null = $state(null);
+  let caret = $state(0);
+  let dismissedToken = $state("");
+  let selectedSuggestionIndex = $state(0);
+  let showGifPicker = $state(false);
+  let gifQuery = $state("");
+
+  const filteredGifs = $derived.by(() => {
+    const query = gifQuery.trim().toLowerCase();
+    return gifLibrary.filter((gif) =>
+      !query || gif.title.toLowerCase().includes(query) || gif.tags.some((tag) => tag.includes(query)),
+    );
+  });
+
+  const activeToken = $derived.by(() => detectActiveToken(value, caret));
+  const activeSuggestions = $derived.by(() => {
+    if (!activeToken || tokenKey(activeToken) === dismissedToken) return [];
+    return activeToken.kind === "slash"
+      ? slashSuggestions(activeToken)
+      : mentionSuggestions(activeToken);
+  });
+
+  $effect(() => {
+    onInputRef(input);
+    return () => onInputRef(null);
+  });
+
+  $effect(() => {
+    if (activeSuggestions.length === 0) {
+      selectedSuggestionIndex = 0;
+      return;
+    }
+    if (selectedSuggestionIndex >= activeSuggestions.length) selectedSuggestionIndex = 0;
+  });
+
+  function detectActiveToken(text: string, position: number): ActiveToken | null {
+    const before = text.slice(0, position);
+    const match = /(^|\s)([/@][^\s]*)$/.exec(before);
+    if (!match) return null;
+    const raw = match[2];
+    const start = before.length - raw.length;
+    if (raw.startsWith("/") && start !== 0) return null;
+    return {
+      kind: raw.startsWith("/") ? "slash" : "mention",
+      start,
+      end: before.length,
+      query: raw.slice(1).toLowerCase(),
+      raw,
+    };
+  }
+
+  function tokenKey(token: ActiveToken): string {
+    return `${token.kind}:${token.start}:${token.raw}`;
+  }
+
+  function updateCaret(node: HTMLTextAreaElement | null = input) {
+    caret = node?.selectionStart ?? value.length;
+  }
+
+  function normalizedCommand(command: string): string {
+    return command.startsWith("/") ? command : `/${command}`;
+  }
+
+  function slashSuggestions(token: ActiveToken): ComposerSuggestion[] {
+    const query = token.query;
+    const registered = slashCommands
+      .filter((command) => !command.revoked_at)
+      .map((command) => {
+        const label = normalizedCommand(command.command);
+        return {
+          id: command.id,
+          kind: "slash" as const,
+          label,
+          detail: command.description || "斜杠命令",
+          insertText: `${label} `,
+          sortText: label.slice(1).toLowerCase(),
+        };
+      });
+    // Bot-declared menu entries merge in behind HTTP-registered commands:
+    // on a name collision the registered command wins (it is the one the
+    // send path dispatches).
+    const taken = new Set(registered.map((suggestion) => suggestion.label));
+    const declared = botCommands
+      .filter((command) => !taken.has(normalizedCommand(command.command)))
+      .map((command) => {
+        const label = normalizedCommand(command.command);
+        return {
+          id: command.id,
+          kind: "slash" as const,
+          label,
+          detail: command.description,
+          insertText: `${label} `,
+          sortText: label.slice(1).toLowerCase(),
+          hint: command.args_hint || undefined,
+          source: command.bot.handle ? `@${command.bot.handle}` : command.bot.display_name,
+        };
+      });
+    return [...registered, ...declared]
+      .filter((suggestion) => !query || suggestion.sortText.includes(query))
+      .sort((a, b) => Number(!a.sortText.startsWith(query)) - Number(!b.sortText.startsWith(query)) || a.sortText.localeCompare(b.sortText))
+      .slice(0, 6);
+  }
+
+  function mentionText(person: User): string {
+    return handleLabel(person.handle || person.display_name.replace(/\s+/g, ""));
+  }
+
+  function mentionSuggestions(token: ActiveToken): ComposerSuggestion[] {
+    const query = token.query;
+    const seen = new Set<string>();
+    return mentionPeople
+      .filter((person) => {
+        if (!person.id || !person.handle?.trim() || seen.has(person.id)) return false;
+        seen.add(person.id);
+        return true;
+      })
+      .map((person) => {
+        const label = mentionText(person);
+        const searchable = `${person.handle || ""} ${person.display_name}`.trim().toLowerCase();
+        return {
+          id: person.id,
+          kind: "mention" as const,
+          label,
+          detail: person.kind === "bot" ? `${person.display_name} · 机器人` : person.display_name,
+          insertText: `${label} `,
+          sortText: searchable,
+        };
+      })
+      .filter((suggestion) => !query || suggestion.sortText.includes(query))
+      .sort((a, b) => Number(!a.sortText.startsWith(query)) - Number(!b.sortText.startsWith(query)) || a.sortText.localeCompare(b.sortText))
+      .slice(0, 6);
+  }
+
+  function pickSuggestion(suggestion: ComposerSuggestion) {
+    if (!activeToken) return;
+    const nextValue = `${value.slice(0, activeToken.start)}${suggestion.insertText}${value.slice(activeToken.end)}`;
+    const nextCaret = activeToken.start + suggestion.insertText.length;
+    void updateValue(nextValue, nextCaret);
+  }
+
+  async function updateValue(nextValue: string, start = nextValue.length, end = start) {
+    if (disabled) return;
+    onValue(nextValue);
+    // The parent owns the draft; restore selection after its value reaches the textarea.
+    await tick();
+    if (disabled) return;
+    input?.focus();
+    input?.setSelectionRange(start, end);
+    caret = start;
+  }
+
+  function applyMarkdownWrap(before: string, after = before, placeholder = "文本") {
+    const start = input?.selectionStart ?? value.length;
+    const end = input?.selectionEnd ?? start;
+    const text = value.slice(start, end) || placeholder;
+    void updateValue(
+      `${value.slice(0, start)}${before}${text}${after}${value.slice(end)}`,
+      start + before.length,
+      start + before.length + text.length,
+    );
+  }
+
+  function closeGifPicker() {
+    if (!showGifPicker) return;
+    showGifPicker = false;
+    gifQuery = "";
+    input?.focus();
+  }
+
+  function pickGif(url: string, title: string) {
+    const prefix = value && !value.endsWith("\n") ? "\n" : "";
+    void updateValue(`${value}${prefix}![${title}](${url})`);
+    closeGifPicker();
+  }
+
+  function handleInput(event: Event) {
+    const node = event.currentTarget as HTMLTextAreaElement;
+    onValue(node.value);
+    updateCaret(node);
+  }
+
+  function handleFocus() {
+    updateCaret();
+    onFocus();
+  }
+
+  function handleKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
+    if (event.key === "Escape" && activeSuggestions.length > 0 && activeToken) {
+      event.preventDefault();
+      dismissedToken = tokenKey(activeToken);
+      input?.focus();
+      return;
+    }
+    if (event.target !== input) return;
+    if (activeSuggestions.length > 0 && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        selectedSuggestionIndex = (selectedSuggestionIndex + direction + activeSuggestions.length) % activeSuggestions.length;
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        pickSuggestion(activeSuggestions[selectedSuggestionIndex]);
+        return;
+      }
+    }
+    onKeydown(event);
+  }
+</script>
+
+<!-- svelte-ignore a11y_no_static_element_interactions (Delegates keys from descendant controls.) -->
+<div class={formClass} data-handles-escape={activeSuggestions.length > 0 ? "" : undefined} onkeydown={handleKeydown}>
+  {#if showToolbar && showGifPicker && !disabled}
+    <GifPicker
+      gifs={filteredGifs}
+      query={gifQuery}
+      onQuery={(query) => (gifQuery = query)}
+      onPick={pickGif}
+      onClose={closeGifPicker}
+    />
+  {/if}
+  {#if activeSuggestions.length > 0}
+    <div class="composer-suggestions" role="listbox" aria-label={activeToken?.kind === "slash" ? "斜杠命令建议" : "提及建议"}>
+      {#each activeSuggestions as suggestion, index (suggestion.id)}
+        <button
+          type="button"
+          class:active={index === selectedSuggestionIndex}
+          role="option"
+          aria-selected={index === selectedSuggestionIndex}
+          onmousedown={(event) => event.preventDefault()}
+          onclick={() => pickSuggestion(suggestion)}
+        >
+          <span class="suggestion-mark" aria-hidden="true">
+            {#if suggestion.kind === "slash"}
+              /
+            {:else}
+              {avatarInitial(suggestion.detail)}
+            {/if}
+          </span>
+          <span class="suggestion-copy">
+            <strong>{suggestion.label}{#if suggestion.hint}<em class="suggestion-hint"> {suggestion.hint}</em>{/if}</strong>
+            <span>{suggestion.detail}</span>
+          </span>
+          <span class="suggestion-kind">{suggestion.source ?? (suggestion.kind === "slash" ? "命令" : "提及")}</span>
+        </button>
+      {/each}
+    </div>
+  {/if}
+  <form
+    class="composer-card"
+    onsubmit={(event) => {
+      event.preventDefault();
+      if (disabled) return;
+      closeGifPicker();
+      onSubmit();
+    }}
+  >
+    {#if pendingUpload}
+      <div class="composer-attachment">
+        <span class="attachment-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="14" height="14"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M21.44 11.05 12.5 20a6 6 0 0 1-8.49-8.49l8.49-8.48a4 4 0 0 1 5.66 5.66l-8.49 8.49a2 2 0 0 1-2.83-2.83L13.41 7.5"/></svg>
+        </span>
+        {#if isImageUpload(pendingUpload)}
+          <img class="pending-image" src={uploadURL(pendingUpload)} alt={pendingUpload.filename} />
+        {/if}
+        <span class="attachment-name">{pendingUpload.filename} · {formatBytes(pendingUpload.byte_size)}</span>
+        <button type="button" class="attachment-remove" aria-label="移除附件" onclick={onRemoveUpload}>×</button>
+      </div>
+    {/if}
+    {#if replyTarget}
+      <ReplyPreview target={replyTarget} onClear={onClearReply} />
+    {/if}
+    <div class="composer-row">
+      {#if showUpload}
+        <label class="composer-icon" title="上传文件">
+          <input type="file" aria-label="上传文件" {disabled} onchange={onUploadFile} />
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M21.44 11.05 12.5 20a6 6 0 0 1-8.49-8.49l8.49-8.48a4 4 0 0 1 5.66 5.66l-8.49 8.49a2 2 0 0 1-2.83-2.83L13.41 7.5"/>
+          </svg>
+        </label>
+      {/if}
+      <textarea
+        bind:this={input}
+        value={value}
+        use:autoGrow={value}
+        rows="1"
+        {placeholder}
+        aria-label={ariaLabel}
+        {disabled}
+        oninput={handleInput}
+        onfocus={handleFocus}
+        onkeyup={() => updateCaret()}
+        onmouseup={() => updateCaret()}
+        onselect={() => updateCaret()}
+      ></textarea>
+      <button type="submit" class="send" aria-label={submitLabel} disabled={disabled || !value.trim()}>
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+          <path fill="currentColor" d="M3 3.5 21 12 3 20.5l3.6-7.5L15 12 6.6 11l-3.6-7.5Z"/>
+        </svg>
+      </button>
+    </div>
+    {#if showToolbar}
+      <ComposerToolbar
+        showGifPicker={showGifPicker}
+        {disabled}
+        onWrap={applyMarkdownWrap}
+        onToggleGif={() => {
+          if (showGifPicker) closeGifPicker();
+          else showGifPicker = true;
+        }}
+      />
+    {/if}
+  </form>
+</div>

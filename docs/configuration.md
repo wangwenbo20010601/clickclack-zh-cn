@@ -1,0 +1,263 @@
+---
+read_when:
+  - adding a config knob
+  - changing precedence between flag, env, and config file
+---
+
+# Configuration
+
+`clickclack serve` resolves config in this order. Later sources override
+earlier ones for any given key:
+
+1. Hard-coded defaults (`Addr=":8080"`, `Data="./data"`).
+2. JSON config file passed via `--config`.
+3. Environment variables.
+4. CLI flags that were explicitly set.
+
+An explicitly present `dev_bootstrap` value in the config file is the one
+exception: it is not replaced by `CLICKCLACK_DEV_BOOTSTRAP`. This prevents a
+stale process environment from silently enabling development authentication
+against a deployment file that explicitly disables it.
+
+Source: `apps/api/internal/config/config.go` and the `applyFlagOverrides`
+hook in `cmd/clickclack/main.go`.
+
+## Flags and env vars
+
+| Flag                  | Env                              | Default     | Notes |
+|-----------------------|----------------------------------|-------------|-------|
+| `--addr`              | `CLICKCLACK_ADDR`                | `:8080`     | HTTP listen address. |
+| `--data`              | `CLICKCLACK_DATA`                | `./data`    | Data root for DB, uploads, logs. |
+| `--db`                | `CLICKCLACK_DB`                  | derived     | DB URL. Defaults to `sqlite://<data>/clickclack.db`. |
+| `--uploads`           | `CLICKCLACK_UPLOADS`             | derived     | Upload storage URL. Defaults to `file://<data>/uploads`; use `r2://bucket/prefix` for Cloudflare R2. |
+| `--environment`       | `CLICKCLACK_ENVIRONMENT`         | unset       | Low-cardinality deployment label used only by opt-in metrics. |
+| `--metrics-enabled`   | `CLICKCLACK_METRICS_ENABLED`     | `false`     | Expose metadata-only Prometheus metrics at `/metrics`; keep private. |
+| `--config`            | —                                | unset       | JSON config file. |
+| `--dev-bootstrap`     | `CLICKCLACK_DEV_BOOTSTRAP`       | `false`     | `serve` only. Creates a default user/workspace/channel and enables local dev auth fallbacks when explicitly set to `true`. |
+| `--password-auth`     | `CLICKCLACK_PASSWORD_AUTH_ENABLED` | `false`   | `serve` only. Enables local email/handle and password sign-in; passwords are set with `clickclack admin user set-password`. See [Auth](features/auth.md). |
+| —                     | `CLICKCLACK_PUBLIC_URL`          | unset       | Canonical external origin. Required for GitHub OAuth and namespaced cookies. |
+| —                     | `CLICKCLACK_PUBLIC_API_URL`      | public URL  | Canonical external API base. May use a different origin and a normalized base path. |
+| —                     | `CLICKCLACK_HOME_URL`            | `/`         | Destination of the workspace rail's home button (`home_url` in the config file). An absolute `http(s)` URL or a path starting with `/`; use it when ClickClack lives inside a larger product. |
+| —                     | `CLICKCLACK_HOME_LABEL`          | `cc`        | Short label (max 32 characters) on that button, e.g. the product name (`home_label` in the config file). The default renders the ClickClack logo mark instead of text. |
+| `--embed-frame-ancestors` | `CLICKCLACK_EMBED_FRAME_ANCESTORS` | unset | Comma- or whitespace-separated exact origins allowed to frame `/embed/*`; see [Embedded threads](features/embedding.md). |
+| `--access-team-domain` | `CLICKCLACK_ACCESS_TEAM_DOMAIN` | unset | Cloudflare Access team HTTPS origin. Must be configured together with the Access audience. |
+| `--access-aud`        | `CLICKCLACK_ACCESS_AUD`         | unset       | Expected Cloudflare Access application audience tag. Must be non-empty when the team domain is set. |
+| —                     | `CLICKCLACK_COOKIE_NAMESPACE`    | unset       | Stable lowercase cookie namespace for multiple trusted ClickClack instances on one hostname. |
+| —                     | `CLICKCLACK_GITHUB_CLIENT_ID`    | unset       | GitHub OAuth app client ID. |
+| —                     | `CLICKCLACK_GITHUB_CLIENT_SECRET`| unset       | GitHub OAuth app client secret. |
+| —                     | `CLICKCLACK_GITHUB_ALLOWED_ORG`  | unset       | Optional GitHub org login gate. Requires `read:org` scope. |
+| —                     | `CLICKCLACK_GITHUB_MODERATOR_ORG`| unset       | Optional GitHub org whose members become guest-workspace moderators. Requires `read:org` scope. |
+| —                     | `CLICKCLACK_PUSHOVER_API_TOKEN`  | unset       | Pushover application API token. Users still opt in with their own Pushover user key in account settings. |
+| — | `CLICKCLACK_WEBPUSH_VAPID_PUBLIC_KEY` | unset | Web Push P-256 public key; configure with the matching private key. Config key: `webpush_vapid_public_key`. |
+| — | `CLICKCLACK_WEBPUSH_VAPID_PRIVATE_KEY` | unset | Web Push private key. Keep it in the server's secret storage. Config key: `webpush_vapid_private_key`. |
+| — | `CLICKCLACK_WEBPUSH_SUBJECT` | public URL | Operator contact as a `mailto:` or HTTPS URI. Config key: `webpush_subject`. See [phone notifications](features/push-notifications.md) for setup and rotation. |
+| —                     | `CLICKCLACK_R2_ACCOUNT_ID`       | unset       | Cloudflare account ID for `r2://` uploads. |
+| —                     | `CLICKCLACK_R2_ACCESS_KEY_ID`    | unset       | R2 API token access key ID. |
+| —                     | `CLICKCLACK_R2_SECRET_ACCESS_KEY`| unset       | R2 API token secret access key. |
+| —                     | `CLICKCLACK_R2_ENDPOINT`         | derived     | Optional S3-compatible endpoint override for tests or non-standard R2 endpoints. |
+
+## Config file
+
+```jsonc
+{
+  "addr": ":8080",
+  "data": "./data",
+  "db": "sqlite:///var/lib/clickclack/clickclack.db",
+  "uploads": "file:///var/lib/clickclack/uploads",
+  "environment": "staging",
+  "metrics_enabled": false,
+  "dev_bootstrap": false,
+  "password_auth_enabled": false,
+  "public_url": "https://chat.example.com",
+  "public_api_url": "https://api.example.com/services/clickclack",
+  "home_url": "/portal",
+  "home_label": "Portal",
+  "embed_frame_ancestors": ["https://control.example.com"],
+  "access_team_domain": "https://openclaw.cloudflareaccess.com",
+  "access_aud": "<application-audience-tag>",
+  "cookie_namespace": "production",
+  "github_client_id": "Iv1.xxxxxxxxxxxx",
+  "github_client_secret": "...",
+  "github_allowed_org": "openclaw",
+  "github_moderator_org": "openclaw",
+  "pushover_api_token": "azGDORePK8gMaC0QOYAMyEEuzJnyUi",
+  "r2_account_id": "91b59577e757131d68d55a471fe32aca",
+  "r2_access_key_id": "...",
+  "r2_secret_access_key": "..."
+}
+```
+
+Pass with `--config /etc/clickclack/config.json`. Values from the file
+are overridden by environment variables; CLI flags override both when
+explicitly set. The `dev_bootstrap` exception is described above.
+
+The Access team domain is an HTTPS origin without credentials, a path, query,
+or fragment. `access_team_domain` and `access_aud` are an all-or-nothing pair;
+when both are absent, trusted-proxy authentication is disabled. See
+[Trusted proxy (Cloudflare Access)](features/auth.md#trusted-proxy-cloudflare-access)
+for verification, provisioning, and session behavior.
+
+## Public frontend and API URLs
+
+`CLICKCLACK_PUBLIC_URL` is an origin, not an application base path. It must:
+
+- use HTTPS for every non-loopback host
+- contain a host and optional non-default port
+- contain no credentials, path, query, fragment, or trailing-dot hostname
+
+For example, `https://chat.example.com` and `http://127.0.0.1:8080` are valid.
+`http://chat.example.com`, `https://chat.example.com/clickclack`, and
+`https://user@chat.example.com` fail startup validation. GitHub OAuth
+credentials also fail startup validation unless the public URL is set.
+
+`CLICKCLACK_PUBLIC_API_URL` is the canonical address browsers and installers
+use for API calls. It defaults to `CLICKCLACK_PUBLIC_URL`, so existing
+same-origin deployments require no change. Set it only when the API has a
+different public origin or a public base path:
+
+```sh
+CLICKCLACK_PUBLIC_URL=https://chat.example.com
+CLICKCLACK_PUBLIC_API_URL=https://api.example.com/services/clickclack
+```
+
+The API URL follows the same scheme, host, credential, query, and fragment
+rules. It may additionally contain a normalized base path made from ordinary
+URL path segments; trailing slashes are removed. Dot segments, doubled
+slashes, encoded separators, whitespace, and backslashes fail startup
+validation. A path-mounted ingress must route
+`/services/clickclack/api/*` to the Go server's `/api/*` routes by stripping
+the configured prefix.
+
+Loopback split origins must both use HTTP and exactly the same hostname; only
+their ports may differ. This keeps local session cookies same-site. Remote
+origins must use HTTPS.
+
+When both URLs are configured, ClickClack injects the canonical API base into
+the SPA HTML it serves. A separate frontend ingress should proxy the SPA and
+asset routes to the ClickClack server while browsers call the configured API
+origin directly. A separately hosted static build must inject the equivalent
+value before the app modules run:
+
+```html
+<script>window.__CLICKCLACK_CONFIG__ = { apiBaseUrl: "https://api.example.com/services/clickclack" };</script>
+```
+
+That value is browser routing only. The server remains authoritative for setup
+claim URLs and returns only URLs derived from validated administrator
+configuration.
+
+## Workspace home link
+
+Set `CLICKCLACK_HOME_URL` and `CLICKCLACK_HOME_LABEL` (or `home_url` and
+`home_label` in the JSON file) when the workspace rail's home button should
+return to a surrounding product. They are independent: an unset or empty URL
+defaults to `/`, and an unset or empty label defaults to `cc`, which the app
+renders as the ClickClack Keystroke logo mark; any other label renders as text
+on the button. Ordinary spaces around values are trimmed. Environment values
+override the file as usual.
+
+The destination must be an absolute HTTP(S) URL without credentials or a path
+starting with a single `/`, such as `/portal?from=chat#latest`. Paths resolve
+on the frontend origin, even when the API is hosted separately. Protocol-relative
+URLs (`//host`), backslashes, and control characters are rejected at startup;
+explicit HTTP(S) destinations may point to another origin.
+
+Labels may contain up to 32 Unicode code points. Long labels are truncated in
+the 48-pixel badge, while the tooltip and accessible name retain the full label.
+The public `GET /api/home-link` endpoint returns only `{ "url": "/", "label": "cc" }`
+by default, with either value replaced when configured. Do not put private
+information in these deployment settings.
+
+The shell reads the endpoint once at startup. Changing settings requires a
+server restart and a page reload. A newer web shell connected to an older server
+without the endpoint retains the built-in defaults. With integrated desktop
+chrome, the default `/` destination stays inside the app as `/app`, even when
+only the label changes. Other non-app destinations use the desktop shell's
+existing system-browser navigation behavior.
+
+## Cookie namespace
+
+The default cookie names remain `cc_session` and `cc_oauth_binding`. Set
+`CLICKCLACK_COOKIE_NAMESPACE` only when multiple trusted ClickClack instances
+must share one hostname:
+
+```sh
+CLICKCLACK_PUBLIC_URL=https://chat.example.com:8443
+CLICKCLACK_COOKIE_NAMESPACE=production
+```
+
+The namespace must be at most 32 characters and contain lowercase letters,
+digits, and interior hyphens. HTTPS deployments receive `__Host-` cookie names,
+such as `__Host-cc-production-session`; path-mounted APIs use the path-compatible
+`__Secure-` prefix and scope cookies to the configured API base path. Loopback HTTP uses
+`cc-production-session`.
+
+Treat the namespace as durable deployment identity:
+
+- Every replica serving the same public origin and database must use the same
+  namespace.
+- Different instances on the same hostname must use different namespaces.
+- Changing it signs browsers out and strands in-progress OAuth browser state
+  until that state expires.
+
+Cookies are scoped to hostnames, not ports. Namespaces prevent accidental
+same-name collisions; they are not a security boundary between mutually
+untrusted services. Put untrusted instances on separate hostnames. Use separate
+registrable domains when compromise of one deployment must not affect another.
+
+## DB URL
+
+SQLite forms:
+
+```
+sqlite://./data/clickclack.db
+./data/clickclack.db
+```
+
+Both end up at the same place — the `sqlite://` prefix is stripped. The
+parent directory is created on open.
+
+Postgres forms:
+
+```
+postgres://user:pass@host:5432/clickclack?sslmode=require
+postgresql://user:pass@host:5432/clickclack?sslmode=require
+```
+
+`serve`, `migrate`, and admin commands all accept `--db` or
+`CLICKCLACK_DB`. Postgres stores durable chat state in the external database.
+
+## Upload storage
+
+Local disk is the default:
+
+```sh
+CLICKCLACK_UPLOADS=file:///var/lib/clickclack/uploads
+```
+
+Cloudflare R2 uses the S3-compatible API:
+
+```sh
+CLICKCLACK_UPLOADS=r2://clickclack-uploads/prod
+CLICKCLACK_R2_ACCOUNT_ID=91b59577e757131d68d55a471fe32aca
+CLICKCLACK_R2_ACCESS_KEY_ID=...
+CLICKCLACK_R2_SECRET_ACCESS_KEY=...
+```
+
+The database still stores upload metadata and auth visibility. The upload
+backend stores the bytes and streams them back through `/api/uploads/{id}` after
+the normal ClickClack permission checks.
+
+## Disabling dev fallbacks
+
+For non-local deployments:
+
+```sh
+clickclack serve \
+  --dev-bootstrap=false \
+  --config /etc/clickclack/config.json
+```
+
+Combine with real auth (CLI-created magic links or GitHub OAuth) so the
+"first-user-in-DB" dev auth fallback never kicks in. In containers, this is
+already the default; `CLICKCLACK_DEV_BOOTSTRAP=false` is only an explicit guard.

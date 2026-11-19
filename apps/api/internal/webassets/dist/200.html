@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="clickclack-desktop-titlebar" content="1" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="theme-color" content="#141926" />
+    <!-- iOS 16.4 through 17.3 read only the apple- prefixed capability meta. -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <title>ClickClack</title>
+    <script>
+      // Apply stored appearance prefs before first paint so forced color,
+      // board, and message-layout choices never flash. Keys and attribute
+      // names mirror src/lib/appearance.ts, which owns them afterwards.
+      try {
+        var ccMode;
+        if (/^\/embed\/(?:channel|thread)\//.test(location.pathname)) {
+          var ccEmbedParams = new URLSearchParams(location.search);
+          var ccHostMode = ccEmbedParams.get("theme");
+          if (ccHostMode === "light" || ccHostMode === "dark") ccMode = ccHostMode;
+          var ccInitialTokens = ccEmbedParams.get("themeTokens");
+          if (ccMode && ccInitialTokens && ccInitialTokens.length <= 16384) {
+            var ccTokens;
+            try {
+              ccTokens = JSON.parse(ccInitialTokens);
+            } catch (e) {
+              ccTokens = null;
+            }
+            if (ccTokens && typeof ccTokens === "object" && !Array.isArray(ccTokens)) {
+              var ccColorTargets = {
+                surface: ["--bg", "--rail"],
+                card: ["--panel"],
+                elevated: ["--panel-2", "--panel-3"],
+                text: ["--text"],
+                "text-strong": ["--text-strong"],
+                muted: ["--muted", "--muted-2"],
+                border: ["--line"],
+                "border-strong": ["--line-strong"],
+                accent: ["--accent", "--brand-a"],
+                "accent-fill": ["--accent-hover", "--brand-b"],
+                "accent-fg": ["--accent-contrast", "--brand-contrast"],
+                ok: ["--success"],
+                warn: ["--warn"],
+                danger: ["--danger"],
+                info: ["--info"],
+              };
+              Object.keys(ccColorTargets).forEach(function (ccToken) {
+                var ccValue = ccTokens[ccToken];
+                if (
+                  typeof ccValue !== "string" ||
+                  ccValue.length > 512 ||
+                  !CSS.supports("color", ccValue)
+                ) {
+                  return;
+                }
+                ccColorTargets[ccToken].forEach(function (ccProperty) {
+                  document.documentElement.style.setProperty(ccProperty, ccValue);
+                });
+              });
+              if (
+                typeof ccTokens.radius === "string" &&
+                ccTokens.radius.length <= 512 &&
+                CSS.supports("border-radius", ccTokens.radius) &&
+                CSS.supports("border-radius", "calc(" + ccTokens.radius + " * 0.67)") &&
+                CSS.supports("border-radius", "calc(" + ccTokens.radius + " * 1.67)") &&
+                CSS.supports("border-radius", "calc(" + ccTokens.radius + " * 2.33)")
+              ) {
+                document.documentElement.style.setProperty("--radius", ccTokens.radius);
+                document.documentElement.style.setProperty(
+                  "--radius-sm",
+                  "calc(" + ccTokens.radius + " * 0.67)",
+                );
+                document.documentElement.style.setProperty(
+                  "--radius-lg",
+                  "calc(" + ccTokens.radius + " * 1.67)",
+                );
+                document.documentElement.style.setProperty(
+                  "--radius-xl",
+                  "calc(" + ccTokens.radius + " * 2.33)",
+                );
+              }
+            }
+          }
+        }
+        if (!ccMode) ccMode = localStorage.getItem("clickclack:color-mode:v1");
+        if (ccMode === "light" || ccMode === "dark") {
+          document.documentElement.setAttribute("data-color-mode", ccMode);
+        }
+        var ccBoard = localStorage.getItem("clickclack:board-theme:v1");
+        if (ccBoard === "ember" || ccBoard === "moss" || ccBoard === "iris") {
+          document.documentElement.setAttribute("data-board", ccBoard);
+        }
+        var ccMessageLayout = localStorage.getItem("clickclack:message-layout:v1");
+        if (ccMessageLayout === "outlined") {
+          document.documentElement.setAttribute("data-message-layout", ccMessageLayout);
+        }
+        var ccDensity = localStorage.getItem("clickclack:density:v1");
+        if (ccDensity === "compact") {
+          document.documentElement.setAttribute("data-density", ccDensity);
+        }
+      } catch (e) {}
+    </script>
+    <link href="/_app/immutable/entry/start.2L4D_1Xc.js" rel="modulepreload">
+		<link href="/_app/immutable/entry/payload.DSmR2FwN.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/DclECHGd.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/jwqb-8vP.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/Dqz7aBZi.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/BZp9foKd.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/Bbkvzshl.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/C6Jfgk1u.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/z51mP5hD.js" rel="modulepreload">
+		<link href="/_app/immutable/entry/app.DmBilHR4.js" rel="modulepreload">
+		<link href="/_app/immutable/nodes/0.D2AnjQ54.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/DK3Fl9T5.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/BCyOjJiP.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/CoQQMPH4.js" rel="modulepreload">
+		<link href="/_app/immutable/chunks/DEPNME54.js" rel="modulepreload">
+		
+		<link href="/_app/immutable/assets/0.SPsCcgD6.css" rel="stylesheet">
+  </head>
+  <body>
+    <div>
+			<script>
+				{
+					__sveltekit_101f3fp = {
+						base: "",
+						version: "0.9.5-zh-CN-20261119"
+					};
+
+					const element = document.currentScript.parentElement;
+
+					import("/_app/immutable/entry/start.2L4D_1Xc.js").then(async (kit) => {
+						kit.init(__sveltekit_101f3fp);
+						const app = await import("/_app/immutable/entry/app.DmBilHR4.js");
+						kit.start(app, element);
+					});
+				}
+			</script>
+		</div>
+  </body>
+</html>

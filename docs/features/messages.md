@@ -1,0 +1,250 @@
+---
+read_when:
+  - changing message create/edit/delete or pagination
+  - touching the `messages` table or `channel_seq`
+  - changing the Markdown body format
+---
+
+# Messages
+
+Channel messages are the core durable object. Every message is Markdown text
+with optional attachments. Threads are modelled as messages with a non-null
+`parent_message_id` (see [threads.md](threads.md)). Inline quote-replies live
+on the same row via `quoted_message_id` and friends, documented in
+[replies.md](replies.md).
+
+## Endpoints
+
+```http
+GET    /api/channels/{channel_id}/messages?after_seq=&before_seq=&around_seq=&mode=&topic_id=&limit=
+POST   /api/channels/{channel_id}/messages
+POST   /api/channels/{channel_id}/read
+GET    /api/messages/by-nonce?workspace_id=...&nonce=...
+GET    /api/messages/{message_id}
+POST   /api/messages/{message_id}/route
+PATCH  /api/messages/{message_id}
+DELETE /api/messages/{message_id}
+```
+
+- `GET` returns root messages only (`parent_message_id IS NULL`) for the
+  channel, ordered by `channel_seq` ascending. `after_seq` and `before_seq` are
+  exclusive cursor windows; `around_seq` returns context around a target
+  sequence. Cursor params are mutually exclusive; `mode=latest` explicitly
+  selects the newest window and cannot be combined with a cursor. `limit` is clamped to
+  `1..200` (default 100). Optional `topic_id` restricts every cursor mode and
+  page-metadata check to one active topic available in the channel. Every
+  returned root includes `thread_state`, including
+  a zero-reply state, so clients can render thread activity without fetching
+  each thread.
+- `POST /messages` accepts
+  `{body, quoted_message_id?, nonce?, topic_id?, kind?, turn_id?}`.
+  Empty bodies are rejected. `nonce` is an optional client idempotency key;
+  replaying the same nonce with the same body, quote, and topic returns the
+  existing message with HTTP 200 instead of creating a duplicate.
+- `GET /api/messages/by-nonce` lets the authenticated author reconcile a
+  durable create after an interrupted request. It returns the matching message,
+  including attachments, or a capability-marked 404 when no message exists.
+  Recovery requires current access to the message's channel or direct
+  conversation, just like reading by message ID.
+  The `X-ClickClack-Message-Nonce: supported` response header distinguishes
+  that result from an older server that does not implement the endpoint.
+- `POST /read` accepts `{seq}` and updates the caller's monotonic read pointer
+  for the channel. The server caps `seq` to the channel's current last root
+  message sequence.
+- `GET /api/messages/{message_id}` returns a single message visible to the
+  current user. DM messages require direct conversation membership.
+- `POST /api/messages/{message_id}/route` idempotently ensures the immutable
+  `M...` route used by Copy link for an accessible channel root. It does not
+  support replies or direct messages, and it performs no historical backfill.
+- `PATCH` accepts `{body}` and only the original author can edit. Sets
+  `edited_at`.
+- `DELETE` is a soft delete — sets `deleted_at`, keeps the row and the
+  `channel_seq` slot so cursors stay valid. Authors can delete their own
+  messages. Workspace owners can also delete messages in workspace channels,
+  while direct messages remain author-only.
+
+Message create, edit, delete, and read updates emit durable events:
+`message.created`, `message.updated`, `message.deleted`, `channel.read`.
+Read events are private to the user who advanced the pointer.
+
+Loading older history preserves the visible message's position, including when
+adjacent messages are grouped by author. The full app and embedded channel view
+share this behavior.
+
+While reading older history, the unread jump bar pulses three times when it
+appears, then rests while keeping the unread count visible. Typing dots animate
+only while someone is typing or an agent is responding; idle conversations keep
+the reserved status area without an ongoing dot animation.
+
+The web message menu exposes **Copy link** for channel roots. It builds the
+absolute URL from the configured public frontend origin and the canonical
+`/app/{workspace_route_id}/{message_route_id}` path. If clipboard access is
+blocked, a focused read-only field exposes the selected URL for manual copy.
+Allocating a link updates only its route metadata; a delayed response cannot
+overwrite a newer message edit.
+
+## Editing in the web app
+
+The message action menu exposes **Edit message** only for the original author.
+It is available for channel messages, direct messages, thread roots, and thread
+replies in both the full app and authenticated channel/thread embeds.
+
+Editing is inline and preserves the exact draft sent to `PATCH`; the server
+continues to own boundary-whitespace normalization. `Ctrl+Enter` or
+`Command+Enter` saves, and `Escape` cancels. Empty normalized bodies are
+rejected before a request is sent. A draft is retained when its channel or
+direct-message view is temporarily unmounted, including virtualized timeline
+rows, while closing a thread explicitly discards an unsaved thread-surface
+draft.
+
+While an input method is composing text, its keys do not save or cancel the
+edit. Cancelling an edit preserves any reply quote in the composer.
+
+Each conversation can have one active editor. Starting another edit in the same
+conversation reveals and focuses the existing editor instead of discarding its
+draft. Reopening that editor keeps it selected and its URL in sync even if an
+earlier navigation finishes later. Drafts in other conversations are retained for
+a bounded number of recent views. Realtime updates refresh an untouched draft;
+if the user already changed it, the editor keeps that draft and warns that the
+message changed elsewhere.
+A delayed save acknowledgement cannot replace a newer edit or restore deleted
+content. Edit acknowledgements also preserve author and attachment updates.
+A pinned-list refresh retains edits saved while it was loading.
+
+## Durable agent activity
+
+Channel and DM create endpoints accept two bot-only activity kinds:
+`agent_commentary` for narration and `agent_tool` for tool execution. Activity
+rows use the normal durable message sequence and realtime fan-out, and rows
+sharing a `turn_id` render as one collapsible preamble in the web app. They do
+not increment unread counts, trigger notifications, or appear in full-text
+search.
+
+Account settings can hide agent commentary and tool calls independently. Saved
+choices remain in effect after reload, including when an older combined
+hide-activity preference was previously enabled.
+
+Publishing activity requires bot-token authentication plus the explicit
+`agent_activity:write` scope, which is intentionally excluded from every
+`bot:*` bundle. Ordinary messages default to `kind: "message"` and reject a
+`turn_id`; human sessions cannot publish either activity kind. Create an
+activity-capable bot token with a scope list such as
+`bot:write,agent_activity:write`.
+
+## Conversation organization and attention
+
+Conversation organization stays attached to the channel timeline, while
+attention is a per-user choice. Topics label and filter messages without
+creating nested rooms. Related channel-wide tools, such as pins and mention
+attention, use the same message metadata and rendering surfaces rather than
+forking the conversation model.
+
+### Topics
+
+Topics are optional labels for channel messages. They are useful for deploys,
+incidents, customer threads, or other lightweight organization without turning
+the channel model into nested rooms.
+
+```http
+GET  /api/workspaces/{workspace_id}/topics
+POST /api/workspaces/{workspace_id}/topics
+```
+
+`POST /topics` accepts `{name, channel_id?}`. A topic without `channel_id` can
+be used by any channel in the workspace. A channel-scoped topic can only be
+used when posting to that channel. Message responses include `topic_id` when a
+topic was supplied. The web channel composer lists the active topics available
+to that channel. Root-message topic labels can be clicked to filter the
+timeline; clearing the visible filter returns to the unfiltered channel.
+Clearing or choosing another filter takes effect while history is loading;
+an older response cannot restore the previous filter or message window.
+
+### Channel attention
+
+Each channel has one server-backed notification preference per member: `all`,
+`mentions`, or `muted`. The channel header controls that preference for both
+browser/desktop alerts and Pushover delivery. Mention-only delivery uses the
+resolved `mentioned_user_ids` event metadata; it does not create a separate
+highlight or appearance setting. Resolvable handles are always marked neutrally
+in timelines and threads; a mention of the current user receives the stronger
+attention style only while the channel preference is `all` or `mentions`.
+Muted channels keep the neutral resolved-handle treatment. See
+[channel notifications](channel-notifications.md) for the API and delivery rules.
+
+### Pinned messages
+
+Pins are shared, channel-wide references rather than per-user bookmarks. The
+pinned panel is independent of the current topic filter and retains topic
+badges and mention rendering. Each channel can hold at most 100 pins. See
+[pinned messages](pinned-messages.md) for the API and event contract.
+
+## Sequence numbers
+
+Every channel message gets a per-channel `channel_seq` assigned inside the
+insert transaction:
+
+```sql
+SELECT COALESCE(MAX(channel_seq), 0) + 1
+FROM messages
+WHERE channel_id = ? AND parent_message_id IS NULL
+```
+
+That sequence is what clients page by, what the realtime event carries, and
+what reconnect uses to backfill. It is monotonic per channel but not globally.
+Thread replies use a separate `thread_seq` instead.
+
+## Body format
+
+Bodies are stored as Markdown text. The `body_format` column is hard-coded to
+`markdown` in V1 and exists so a future format (rich text, plain) can be added
+without a migration. The frontend renders a sanitized subset.
+
+The web composer is a Slack-like message well with a format bar for bold,
+italic, inline code, code blocks, links, attachments, and GIF insertion. The GIF
+picker inserts standard Markdown image syntax, so no provider-specific durable
+schema is required for V1.
+Searching for a GIF never submits the message draft.
+`Escape` closes the active GIF picker or suggestion menu while preserving the
+draft and reply quote. Once both are closed, `Escape` clears the quote.
+
+Sending from history returns to the latest messages. A failed refresh keeps the
+confirmed message visible and reports the refresh error. Dismiss any open search
+results and press Escape to retry the jump. Selecting history while a send,
+attachment, or refresh is pending keeps that selection even if the operation fails.
+Background message edits, deletions, and deleted bot identities update in place
+without changing the history selection or cancelling that return to live chat.
+Changes received while history is loading stay applied when its snapshot arrives.
+Returning to live chat or pressing Escape also preserves pending message updates.
+A delayed refresh in an embedded channel cannot undo an acknowledged edit or
+restore a deleted message.
+
+## Attachments
+
+Messages carry zero or more attachments via the `message_attachments` join
+table. Hydration happens in `hydrateAttachments` and surfaces as the
+`attachments` field on `Message`. See [uploads.md](uploads.md) for the
+two-step upload-then-attach flow.
+
+The web client renders image, video, audio, PDF, and text attachments as
+compact preview cards where safe, and links other attachments as authenticated
+download cards. Clicking an inline image attachment, or an image inside
+rendered Markdown, opens an in-app image viewer with an Open original link.
+Markdown image URLs, including animated GIF URLs, render inline through the
+same sanitized Markdown path.
+
+Giphy-backed Markdown GIF images play briefly, then swap to a still preview
+with a small replay button in the lower-right corner. Pressing replay reloads
+the animated GIF and repeats the same play-once behavior. Other GIF URLs render
+normally when no still preview is available.
+
+## Author hydration
+
+`ListMessages` and `GetThread` join `users` and populate `Message.author` so
+clients don't need a second round-trip. Avatar URLs are passed through as-is.
+
+## What is intentionally missing
+
+- Hard delete. The soft-delete row stays for cursor stability.
+- Per-user message bookmarks. Channel pins are shared workspace state.
+- Per-message permissions beyond author edit/delete and workspace-owner channel
+  deletion.

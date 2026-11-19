@@ -1,0 +1,295 @@
+---
+read_when:
+  - changing the TypeScript SDK or the OpenAPI shape
+  - adding or maintaining bot examples
+---
+
+# TypeScript SDK
+
+`@clickclack/sdk-ts` is the framework-neutral client. It wraps the HTTP API
+and the realtime WebSocket without any Svelte dependency, so bots, CLIs, and
+non-Svelte frontends can use it directly.
+
+Source: `packages/sdk-ts/src/index.ts`.
+
+## Install (workspace)
+
+The SDK is published from the monorepo. Inside this repo, depend on it as
+`@clickclack/sdk-ts` via pnpm workspaces. External consumers will install it
+once it's published.
+
+## Quick start
+
+```ts
+import { ClickClackClient } from "@clickclack/sdk-ts";
+
+const client = new ClickClackClient({
+  baseUrl: "http://localhost:8080",
+  token: process.env.CLICKCLACK_TOKEN,        // session token or ccb_ bot token
+  userId: process.env.CLICKCLACK_USER_ID,     // optional local/dev override
+});
+
+const me = await client.me();
+await client.updateMe({ display_name: "Peter Steinberger", handle: "@steipete" });
+await client.updateMe({ appearance_preferences: { board_theme: "iris" } });
+const workspaces = await client.workspaces.list();
+const channels = await client.channels.list(workspaces[0].id);
+const message = await client.channels.sendMessage(channels[0].id, {
+  body: "click clack",
+  nonce: crypto.randomUUID(),
+});
+await client.channels.markRead(channels[0].id, message.channel_seq ?? 0);
+```
+
+## Auth
+
+The client sends, in this order:
+
+- `Authorization: Bearer <token>` if `token` was set or `auth.consumeMagicLink`
+  succeeded (it stores the returned session token).
+- `X-ClickClack-User: <userId>` if `userId` was set. Use this only for local
+  development/test impersonation; hosted bots should use bearer tokens.
+
+Helpers:
+
+```ts
+client.auth.requestMagicLink({ email });          // POST /api/auth/magic/request
+client.auth.consumeMagicLink(token);              // POST /api/auth/magic/consume; sets bearer
+client.auth.setToken(token);                      // store an externally-issued token
+client.auth.githubStartUrl();                     // build the OAuth start URL for the browser
+```
+
+See [features/auth.md](features/auth.md).
+
+## Surface
+
+| Group         | Methods |
+|---------------|---------|
+| `me()`, `updateMe()` | get or edit the current user's profile |
+| `workspaces`  | `list`, `create`, `get`, `update`, `transferOwnership`, `delete` |
+| `topics`      | `list`, `create` |
+| `bots`        | `listMine`, `list`, `create`, `removeMembership`, `delete`, `listWorkspaceTokens`, `createWorkspaceToken`, `listTokens`, `createToken`, `revokeToken` |
+| `apps`        | `list`, `install`, `revoke(id, options?)` |
+| `slashCommands` | `list`, `create`, `revoke`, `rotateSecret` |
+| `eventSubscriptions` | `list`, `create`, `revoke`, `rotateSecret`, `deliveries(id, options?)` |
+| `eventTypes`  | `list` |
+| `auditLog`     | `list` |
+| `connectedAccounts` | `list`, `create`, `revoke` |
+| `channels`    | `list`, `create`, `update`, `messages`, `sendMessage`, `markRead` |
+| `messages`    | `get`, `findByNonce(workspaceId, nonce)`, `update`, `delete` |
+| `threads`     | `get`, `reply` |
+| `search(workspaceId, q, options?)` | paginated workspace, channel, or direct-message search |
+| `uploads`     | `create(workspaceId, file, filename?, { nonce? })`, `findByNonce(workspaceId, nonce)`, `attach(messageId, uploadId)` |
+| `dms`         | `list`, `create`, `get`, `close`, `open`, `messages`, `sendMessage`, `markRead` |
+| `events`      | `list`, `publishEphemeral`, `subscribe` |
+
+## Thread history
+
+`Message` uses the generated API schema across channel history, DM history,
+and thread replies. Root messages expose optional `thread_state`; messages
+retain optional `attachments` typed as `Upload[]`.
+
+`threads.get` preserves the earliest-first default and supports bounded latest,
+before, after, and around windows. Sequences are local to the thread:
+
+```ts
+const latest = await client.threads.get(rootId, { latest: true, limit: 100 });
+if (latest.has_older) {
+  const older = await client.threads.get(rootId, { before_seq: latest.oldest_seq, limit: 50 });
+}
+const target = await client.threads.get(rootId, { around_seq: reply.thread_seq, limit: 100 });
+```
+
+Each response is a `ThreadPage`: the existing `Thread` shape (root, hydrated
+replies, and the full thread summary) plus required reply sequence bounds and
+`has_older` / `has_newer`. Existing values typed as `Thread` need no paging fields. See
+[threads](features/threads.md#ordering-and-pagination) for cursor validation and
+empty-page semantics.
+
+## Realtime subscription
+
+Capture the current tail or drain a bounded backlog through the same client:
+
+```ts
+const initial = await client.events.list({ workspaceId, includeTail: true });
+const page = await client.events.list({
+  workspaceId,
+  afterCursor: initial.tailCursor,
+  limit: 500,
+});
+```
+
+`tailCursor` is captured before the initial page query, so events created during
+startup remain eligible for the following WebSocket subscription.
+
+```ts
+const socket = client.events.subscribe({
+  workspaceId,
+  afterCursor: lastSeenCursor,
+  onEvent(event) {
+    // event.type, event.payload, event.cursor
+  },
+  onClose() {
+    // backoff and resubscribe with the latest cursor
+  },
+});
+```
+
+`subscribe` returns a raw `WebSocket`. Call `.close()` to disconnect. See
+[features/realtime.md](features/realtime.md) for cursor recovery rules.
+
+Realtime payload keys are `unknown`: ephemeral publishers can supply arbitrary
+metadata, including a non-string `correlation_id`. Check a value's type before
+using it, for example `typeof event.payload.correlation_id === "string"`.
+Emitted events have object payloads; successful no-op mutation receipts can
+instead contain an empty event with a `null` payload.
+
+Bot tokens can publish typed, target-scoped agent progress:
+
+```ts
+await client.events.publishEphemeral({
+  workspaceId,
+  channelId,
+  type: "agent.progress",
+  payload: {
+    turn_id: sourceMessageId,
+    seq: 1,
+    op: "append",
+    line: { id: "tool-1", kind: "tool", tool_name: "web_search", status: "running" },
+  },
+});
+```
+
+`agent.progress` requires a bot token and exactly one channel or DM target.
+Typing events have the same target rule. Presence events may instead omit both
+targets to publish workspace-wide.
+
+## Generated types
+
+`packages/sdk-ts/src/generated/openapi.d.ts` is generated from
+`packages/protocol/openapi.yaml`. Re-export at the top of `index.ts`:
+
+```ts
+export type { components, paths } from "./generated/openapi";
+```
+
+Use the friendly exported types (`User`, `Workspace`, `Message`, etc.)
+for app code. Resource types reuse the generated OpenAPI schemas, so the
+protocol owns their fields and optionality. Client input helpers retain richer
+constraints, such as mutually exclusive message and event targets. Reach into
+`components["schemas"]` for other wire shapes.
+
+## Bot accounts
+
+Hosted bots should use bot tokens, not human session tokens. Create one from
+the admin CLI:
+
+```sh
+clickclack admin bot create \
+  --workspace wsp_... \
+  --created-by usr_manager \
+  --name "OpenClaw Service" \
+  --handle openclaw \
+  --scopes bot:write \
+  --plain
+```
+
+The returned `ccb_...` token goes into `CLICKCLACK_TOKEN`.
+
+Human-session clients can also manage bot lifecycle through the SDK:
+
+```ts
+const { bot, bot_token } = await client.bots.create(workspaceId, {
+  display_name: "OpenClaw Service",
+  handle: "openclaw",
+  token_name: "prod",
+  scopes: ["bot:write"],
+});
+
+const tokens = await client.bots.listWorkspaceTokens(workspaceId, bot.id);
+await client.bots.revokeToken(tokens[0].id);
+```
+
+`client.bots.removeMembership(workspaceId, bot.id)` removes only one workspace
+membership. `client.bots.delete(bot.id)` globally retires the bot, revokes all
+of its resources, preserves historical attribution, and releases its handle.
+
+Use `createWorkspaceToken(workspaceId, bot.id, input)` for rotation. The older
+`listTokens` and `createToken` helpers call the legacy bot-only routes and only
+work for bots installed in exactly one workspace.
+
+Only `create`, `createToken`, and `createWorkspaceToken` responses include the
+one-time raw `bot_token.token`. List calls return metadata only.
+
+Setup-code mint and claim helpers expose the versioned endpoint contract:
+
+```ts
+const setup = await client.bots.createSetupCode(workspaceId, bot.id);
+// setup.contract_version === 1
+// setup.claim_url is the exact server-issued endpoint
+
+const claim = await client.bots.claimSetupCode(setup.code!);
+// claim.api_base_url is the canonical base an installer persists
+```
+
+The initialized SDK client still claims against its own base URL. Installers
+that receive a setup URI must initialize the client from the server-issued
+endpoint/base rather than constructing `/api/bot-setup-codes/claim` from the
+frontend origin.
+
+Bot runtimes can atomically publish their command menu with their own token:
+
+```ts
+await client.bots.setCommands([
+  { command: "status", description: "Show agent status" },
+  { command: "new", description: "Start a new session", args_hint: "[message]" },
+]);
+
+const commands = await client.bots.listCommands(workspaceId);
+```
+
+`setCommands([])` clears the authenticated bot's menu. It requires
+`commands:write`; listing requires workspace membership and `workspaces:read`
+for bot tokens.
+
+The SDK also exports `ClickClackBot`, a tiny runner around the same client plus
+the realtime WebSocket:
+
+```ts
+import { ClickClackBot } from "@clickclack/sdk-ts";
+
+const bot = new ClickClackBot({
+  baseUrl: "http://localhost:8080",
+  token: process.env.CLICKCLACK_TOKEN,
+  workspaceId: process.env.CLICKCLACK_WORKSPACE_ID!,
+  onEvent(event, client) {
+    if (event.type !== "message.created") return;
+    const channelId = event.channel_id;
+    if (channelId) void client.channels.sendMessage(channelId, { body: "ack" });
+  },
+});
+
+bot.start();
+```
+
+`start()` reuses a connecting or open socket. `stop()` disconnects without
+calling `onClose`. Other closes of the active socket still call `onClose`;
+delayed closes from stopped connections do not notify a replacement.
+
+Persist `event.cursor` after each handled event and reconnect with
+`afterCursor` for exactly-once-ish processing. Ignore events whose
+`payload.author_id` matches the bot's own user ID to avoid loops.
+
+See [features/bots.md](features/bots.md) and [bot-installs.md](bot-installs.md).
+
+## Example package
+
+`examples/bot-ts` is a minimal one-shot bot that sends a single message:
+
+```sh
+CLICKCLACK_URL=http://localhost:8080 \
+CLICKCLACK_TOKEN=ccb_... \
+CLICKCLACK_CHANNEL_ID=chn_... \
+CLICKCLACK_TEXT="clack from bot" \
+pnpm --filter @clickclack/example-bot start
+```

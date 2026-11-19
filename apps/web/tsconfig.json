@@ -1,0 +1,15 @@
+{
+  "extends": "$app/tsconfig",
+  "compilerOptions": {
+    "allowJs": false,
+    "checkJs": false,
+    "isolatedModules": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "target": "ES2022",
+    "types": ["svelte", "$app/types"]
+  },
+  "include": ["src", "*"],
+  "exclude": ["src/**/*.test.ts", "src/service-worker.ts"]
+}

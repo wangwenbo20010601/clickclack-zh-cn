@@ -1,0 +1,595 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"io/fs"
+	"net/url"
+	"os"
+	"sort"
+	"sync"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/openclaw/clickclack/apps/api/internal/requestmeta"
+	"github.com/openclaw/clickclack/apps/api/internal/store"
+)
+
+func TestWorkspaceMemberPageMigrationUpgradesExistingData(t *testing.T) {
+	ctx := context.Background()
+	st := newIsolatedPostgresTestStore(t)
+	applyPostgresMigrationsBefore(t, ctx, st, "0013_workspace_member_page_indexes.sql")
+
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO users (id, display_name, handle, created_at)
+		VALUES
+			('usr_owner', 'Owner', 'owner', $1),
+			('usr_unicode', 'ÉLODIE', 'ÉLODIE-HANDLE', $2)`,
+		now(), now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO workspaces (id, name, slug, created_at)
+		VALUES ('wsp_upgrade', 'Upgrade', 'upgrade', $1)`,
+		now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+		VALUES
+			('wsp_upgrade', 'usr_owner', 'owner', $1),
+			('wsp_upgrade', 'usr_unicode', 'member', $2)`,
+		now(), now(),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var roleSort int
+	var sortName, sortHandle string
+	if err := st.db.QueryRowContext(ctx, `
+		SELECT role_sort, sort_name, sort_handle
+		FROM workspace_members
+		WHERE workspace_id = 'wsp_upgrade' AND user_id = 'usr_unicode'`,
+	).Scan(&roleSort, &sortName, &sortHandle); err != nil {
+		t.Fatal(err)
+	}
+	if roleSort != 2 || sortName != "élodie" || sortHandle != "élodie-handle" {
+		t.Fatalf("unexpected migrated sort keys: role=%d name=%q handle=%q", roleSort, sortName, sortHandle)
+	}
+	var indexCount int
+	if err := st.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM pg_indexes
+		WHERE schemaname = current_schema()
+		  AND indexname = 'idx_workspace_members_page'`,
+	).Scan(&indexCount); err != nil {
+		t.Fatal(err)
+	}
+	if indexCount != 1 {
+		t.Fatalf("expected workspace member page index, got %d", indexCount)
+	}
+
+	page, err := st.ListWorkspaceMemberPage(ctx, "wsp_upgrade", "usr_owner", store.WorkspaceMemberPageRequest{
+		Query: "ÉLO",
+		Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.TotalCount == nil || *page.TotalCount != 1 || len(page.Members) != 1 || page.Members[0].User.ID != "usr_unicode" {
+		t.Fatalf("unexpected migrated member page: %#v", page)
+	}
+}
+
+func TestWorkspaceIconMigrationUpgradesExistingData(t *testing.T) {
+	ctx := context.Background()
+	st := newIsolatedPostgresTestStore(t)
+	applyPostgresMigrationsBefore(t, ctx, st, "0014_workspace_icon_url.sql")
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO users (id, display_name, handle, created_at)
+		VALUES ('usr_icon_owner', 'Icon Owner', 'icon-owner', $1)`, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO workspaces (id, route_id, name, slug, created_at)
+		VALUES ('wsp_icon_upgrade', 'THQICONUPGRADE01', 'Icon Upgrade', 'icon-upgrade', $1)`, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+		VALUES ('wsp_icon_upgrade', 'usr_icon_owner', 'owner', $1)`, now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.GetWorkspace(ctx, "wsp_icon_upgrade", "usr_icon_owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.IconURL != "" {
+		t.Fatalf("expected migrated workspace icon_url to default empty, got %#v", workspace)
+	}
+	if pending, err := st.ListPendingUploadCleanups(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("expected upgraded cleanup queue to be available and empty, got %#v err=%v", pending, err)
+	}
+}
+
+func TestPostgresStoreSmoke(t *testing.T) {
+	dsn := os.Getenv("CLICKCLACK_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set CLICKCLACK_POSTGRES_TEST_DSN to run Postgres integration smoke")
+	}
+	ctx := context.Background()
+	st, err := Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	suffix := time.Now().UTC().Format("20060102150405.000000000")
+	ownerEmail := "pg-owner-" + suffix + "@example.com"
+	owner, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Postgres Owner", Email: ownerEmail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerGravatar := store.ResolveAvatarURL("", ownerEmail)
+	if owner.AvatarURL != ownerGravatar {
+		t.Fatalf("expected Postgres Gravatar %q, got %#v", ownerGravatar, owner)
+	}
+	ownerSession, err := st.CreateSession(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE users SET avatar_url = '' WHERE id = $1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sessionUser, err := st.GetSessionUser(ctx, ownerSession.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionUser.AvatarURL != ownerGravatar {
+		t.Fatalf("expected migrated Postgres Gravatar %q, got %#v", ownerGravatar, sessionUser)
+	}
+	identitySubject := "pg-avatar-" + suffix
+	identityUser, err := st.UpsertIdentityUser(ctx, store.UpsertIdentityUserInput{
+		Provider:        "github",
+		ProviderSubject: identitySubject,
+		Email:           identitySubject + "@example.com",
+		DisplayName:     "Postgres Avatar",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityUser, err = st.UpsertIdentityUser(ctx, store.UpsertIdentityUserInput{
+		Provider:        "github",
+		ProviderSubject: identitySubject,
+		Email:           identitySubject + "@example.com",
+		AvatarURL:       "https://example.com/postgres-provider.png",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identityUser.AvatarURL != "https://example.com/postgres-provider.png" {
+		t.Fatalf("expected Postgres provider avatar to replace Gravatar, got %#v", identityUser)
+	}
+	workspace, err := st.CreateWorkspace(ctx, store.CreateWorkspaceInput{Name: "Postgres Smoke " + suffix}, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, _, err := st.CreateChannel(ctx, store.CreateChannelInput{WorkspaceID: workspace.ID, UserID: owner.ID, Name: "pg-smoke", Kind: "public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	topic, err := st.CreateTopic(ctx, store.CreateTopicInput{
+		WorkspaceID: workspace.ID,
+		ChannelID:   channel.ID,
+		Name:        "Postgres topic",
+		CreatedBy:   owner.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageCtx := requestmeta.WithCorrelationID(ctx, "corr-postgres-message")
+	created, event, err := st.CreateMessage(messageCtx, store.CreateMessageInput{ChannelID: channel.ID, AuthorID: owner.ID, Body: "hello postgres", TopicID: topic.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if event.ID == "" || event.Seq == nil || *event.Seq != 1 {
+		t.Fatalf("unexpected event: %#v", event)
+	}
+	assertPostgresEventPayloadValue(t, event, "correlation_id", "corr-postgres-message")
+	assertPostgresEventPayloadMissing(t, event, "body")
+	page, err := st.ListMessages(ctx, channel.ID, owner.ID, store.MessagePageRequest{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Messages) != 1 || page.Messages[0].ID != created.ID {
+		t.Fatalf("unexpected messages: %#v", page.Messages)
+	}
+	topicPage, err := st.ListMessages(ctx, channel.ID, owner.ID, store.MessagePageRequest{Limit: 10, TopicID: topic.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(topicPage.Messages) != 1 || topicPage.Messages[0].TopicID != topic.ID {
+		t.Fatalf("unexpected filtered topic messages: %#v", topicPage.Messages)
+	}
+	replyCtx := requestmeta.WithCorrelationID(ctx, "corr-postgres-reply")
+	_, state, replyEvents, err := st.CreateThreadReply(replyCtx, store.CreateThreadReplyInput{RootMessageID: created.ID, AuthorID: owner.ID, Body: "postgres thread reply"})
+	if err != nil || state.ReplyCount != 1 {
+		t.Fatalf("unexpected thread reply result: %#v err=%v", state, err)
+	}
+	if len(replyEvents) != 2 || replyEvents[0].Type != "thread.reply_created" {
+		t.Fatalf("unexpected thread reply events: %#v", replyEvents)
+	}
+	assertPostgresEventPayloadValue(t, replyEvents[0], "correlation_id", "corr-postgres-reply")
+	assertPostgresEventPayloadMissing(t, replyEvents[1], "correlation_id")
+	persisted, err := st.ListEventsAfter(ctx, workspace.ID, owner.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedByID := make(map[string]store.Event, len(persisted))
+	for _, persistedEvent := range persisted {
+		persistedByID[persistedEvent.ID] = persistedEvent
+	}
+	assertPostgresEventPayloadValue(t, persistedByID[event.ID], "correlation_id", "corr-postgres-message")
+	assertPostgresEventPayloadValue(t, persistedByID[replyEvents[0].ID], "correlation_id", "corr-postgres-reply")
+	threadPage, err := st.ListMessages(ctx, channel.ID, owner.ID, store.MessagePageRequest{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threadPage.Messages) != 1 || threadPage.Messages[0].ThreadState == nil || threadPage.Messages[0].ThreadState.ReplyCount != 1 {
+		t.Fatalf("expected hydrated thread state in postgres message page, got %#v", threadPage.Messages)
+	}
+	results, err := st.SearchMessagePage(ctx, store.SearchPageRequest{
+		WorkspaceID: workspace.ID,
+		ChannelID:   channel.ID,
+		UserID:      owner.ID,
+		Query:       "postgres",
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundCreated := false
+	for _, result := range results.Results {
+		if result.ID == created.ID {
+			foundCreated = true
+			if result.Snippet == "" || len(result.Highlights) == 0 {
+				t.Fatalf("expected highlighted search snippet: %#v", result)
+			}
+			break
+		}
+	}
+	if !foundCreated {
+		t.Fatalf("unexpected search results: %#v", results)
+	}
+}
+
+func postgresTestSchemaName() string {
+	return newID("member_upgrade")
+}
+
+func TestPostgresSchemaNamesAreUniqueWithinClockTick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		seen := map[string]bool{}
+		for range 32 {
+			name := postgresTestSchemaName()
+			if seen[name] {
+				t.Fatalf("two fixtures chose the same schema within one clock tick: %s", name)
+			}
+			seen[name] = true
+		}
+	})
+}
+
+func newIsolatedPostgresTestStore(t *testing.T) *Store {
+	t.Helper()
+	dsn := os.Getenv("CLICKCLACK_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set CLICKCLACK_POSTGRES_TEST_DSN to run Postgres integration smoke")
+	}
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := adminDB.Ping(); err != nil {
+		_ = adminDB.Close()
+		t.Fatal(err)
+	}
+	schema := postgresTestSchemaName()
+	if _, err := adminDB.Exec(`CREATE SCHEMA ` + schema); err != nil {
+		_ = adminDB.Close()
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		_, _ = adminDB.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		_ = adminDB.Close()
+		t.Fatal(err)
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	query.Set("application_name", schema)
+	parsed.RawQuery = query.Encode()
+	st, err := Open(parsed.String())
+	if err != nil {
+		_, _ = adminDB.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		_ = adminDB.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = st.Close()
+		_, _ = adminDB.Exec(`DROP SCHEMA ` + schema + ` CASCADE`)
+		_ = adminDB.Close()
+	})
+	return st
+}
+
+func TestCreateReservedUploadSerializesWithNonceRetries(t *testing.T) {
+	ctx := context.Background()
+	st := newIsolatedPostgresTestStore(t)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Upload Owner", "postgres-upload-nonce@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := workspaces[0]
+	const nonce = "postgres-upload-finalization"
+	reservation, err := st.ReserveUploadQuota(ctx, workspace.ID, owner.ID, nonce, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback()
+	if err := lockUploadNonceTx(ctx, blocker, owner.ID, nonce); err != nil {
+		t.Fatal(err)
+	}
+
+	blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	_, err = st.CreateReservedUpload(blockedCtx, reservation.ID, store.CreateUploadInput{
+		WorkspaceID: workspace.ID,
+		OwnerID:     owner.ID,
+		Nonce:       nonce,
+		Filename:    "blocked.txt",
+		ContentType: "text/plain",
+		ByteSize:    4,
+		StoragePath: "memory://blocked.txt",
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected finalization to wait for the nonce lock, got %v", err)
+	}
+	if err := blocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	upload, err := st.CreateReservedUpload(ctx, reservation.ID, store.CreateUploadInput{
+		WorkspaceID: workspace.ID,
+		OwnerID:     owner.ID,
+		Nonce:       nonce,
+		Filename:    "committed.txt",
+		ContentType: "text/plain",
+		ByteSize:    4,
+		StoragePath: "memory://committed.txt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upload.Nonce != nonce {
+		t.Fatalf("finalized upload lost nonce: %#v", upload)
+	}
+}
+
+func TestNormalizeClientNonceRejectsDatabaseInvalidText(t *testing.T) {
+	t.Parallel()
+
+	for _, nonce := range []string{string([]byte{0xff}), "invalid\x00nonce"} {
+		if _, err := store.NormalizeClientNonce(nonce); err == nil {
+			t.Fatalf("expected database-invalid nonce rejection for %q", nonce)
+		}
+	}
+}
+
+func applyPostgresMigrationsBefore(t *testing.T, ctx context.Context, st *Store, cutoff string) {
+	t.Helper()
+	if _, err := st.db.ExecContext(ctx, `CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		name := entry.Name()
+		if name >= cutoff {
+			continue
+		}
+		body, err := migrationsFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := st.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("%s: %v", name, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_migrations (name, applied_at) VALUES ($1, $2)`, name, now()); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("%s migration record: %v", name, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func assertPostgresEventPayloadValue(t *testing.T, event store.Event, key, want string) {
+	t.Helper()
+	got, ok := postgresEventPayloadValue(event, key)
+	if !ok || got != want {
+		t.Fatalf("event %s payload[%q] = %q, %v; want %q", event.ID, key, got, ok, want)
+	}
+}
+
+func assertPostgresEventPayloadMissing(t *testing.T, event store.Event, key string) {
+	t.Helper()
+	if got, ok := postgresEventPayloadValue(event, key); ok {
+		t.Fatalf("event %s unexpectedly has payload[%q] = %q", event.ID, key, got)
+	}
+}
+
+func postgresEventPayloadValue(event store.Event, key string) (string, bool) {
+	switch payload := event.Payload.(type) {
+	case map[string]string:
+		value, ok := payload[key]
+		return value, ok
+	case map[string]any:
+		value, ok := payload[key].(string)
+		return value, ok
+	default:
+		return "", false
+	}
+}
+
+func TestPostgresConcurrentChannelMessages(t *testing.T) {
+	dsn := os.Getenv("CLICKCLACK_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("set CLICKCLACK_POSTGRES_TEST_DSN to run Postgres integration smoke")
+	}
+	ctx := context.Background()
+	st, err := Open(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	suffix := time.Now().UTC().Format("20060102150405.000000000")
+	owner, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Postgres Owner", Email: "pg-concurrent-" + suffix + "@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.CreateWorkspace(ctx, store.CreateWorkspaceInput{Name: "Postgres Concurrent " + suffix}, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, _, err := st.CreateChannel(ctx, store.CreateChannelInput{WorkspaceID: workspace.ID, UserID: owner.ID, Name: "pg-concurrent", Kind: "public"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const count = 24
+	start := make(chan struct{})
+	errs := make(chan error, count)
+	seqs := make(chan int64, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			msg, _, err := st.CreateMessage(ctx, store.CreateMessageInput{
+				ChannelID: channel.ID,
+				AuthorID:  owner.ID,
+				Body:      "concurrent postgres message " + time.Now().UTC().Format(time.RFC3339Nano),
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			if msg.ChannelSeq == nil {
+				t.Errorf("message %d has nil channel seq", i)
+				return
+			}
+			seqs <- *msg.ChannelSeq
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(seqs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	got := make([]int64, 0, count)
+	for seq := range seqs {
+		got = append(got, seq)
+	}
+	sort.Slice(got, func(i, j int) bool { return got[i] < got[j] })
+	if len(got) != count {
+		t.Fatalf("got %d messages, want %d: %v", len(got), count, got)
+	}
+	for i, seq := range got {
+		want := int64(i + 1)
+		if seq != want {
+			t.Fatalf("seq[%d] = %d, want %d; all seqs: %v", i, seq, want, got)
+		}
+	}
+}
+
+func TestPostgresChannelAdministrationRequiresOwner(t *testing.T) {
+	ctx := context.Background()
+	st := newIsolatedPostgresTestStore(t)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "pg-channel-admin-owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{store.WorkspaceRoleModerator, store.WorkspaceRoleMember} {
+		user, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: role, Email: "pg-channel-admin-" + role + "@example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.AddWorkspaceMember(ctx, workspaces[0].ID, user.ID, role); err != nil {
+			t.Fatal(err)
+		}
+		archived := true
+		if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channels[0].ID, UserID: user.ID, Archived: &archived}); !errors.Is(err, store.ErrWorkspaceOwnerRequired) {
+			t.Fatalf("%s channel archive error = %v, want %v", role, err, store.ErrWorkspaceOwnerRequired)
+		}
+	}
+	archived := true
+	if updated, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channels[0].ID, UserID: owner.ID, Archived: &archived}); err != nil || updated.ArchivedAt == nil {
+		t.Fatalf("owner archive = %#v, %v", updated, err)
+	}
+}

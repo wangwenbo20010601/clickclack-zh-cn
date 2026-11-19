@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="ClickClack">
+  <defs>
+    <filter id="shadow" x="52" y="52" width="920" height="940" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="26" stdDeviation="26" flood-color="#04070c" flood-opacity=".38"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <rect x="92" y="92" width="840" height="840" rx="200" fill="#141926"/>
+    <rect x="104" y="104" width="816" height="816" rx="188" fill="none" stroke="#bed2ff" stroke-opacity=".13" stroke-width="10"/>
+  </g>
+
+  <!-- Keystroke mark: raised key (clack) and pressed key (click), 64-unit grid scaled 13.125x -->
+  <g transform="translate(92,92) scale(13.125)">
+    <rect x="10" y="21" width="20" height="20" rx="5" fill="#070b12"/>
+    <rect x="10" y="16" width="20" height="20" rx="5" fill="#edf2f9"/>
+    <rect x="34" y="28" width="20" height="20" rx="5" fill="#17638f"/>
+    <rect x="34" y="26.5" width="20" height="20" rx="5" fill="#41c6ff"/>
+  </g>
+</svg>

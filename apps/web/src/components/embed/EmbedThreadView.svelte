@@ -1,0 +1,567 @@
+<script lang="ts">
+  import { ThreadController } from "../../lib/thread.svelte";
+  import { onDestroy, onMount, tick } from "svelte";
+  import ImageViewer from "../media/ImageViewer.svelte";
+  import KeystrokeMark from "../KeystrokeMark.svelte";
+  import ThreadPanel from "../thread/ThreadPanel.svelte";
+  import { markdownImageViewerURL } from "../../lib/actions/markdown";
+  import { APIError, api, apiResourceURL, readableAPIError } from "../../lib/api";
+  import { requestCurrentUser } from "../../lib/appearance";
+  import { channelDisplayTitle } from "../../lib/chat/channels";
+  import { dmTitle } from "../../lib/chat/people";
+  import { listAllWorkspaceMembers, memberLoadErrorMessage } from "../../lib/workspace-members";
+  import {
+    MessageEditController,
+    type MessageEdit,
+    type MessageEditSession,
+  } from "../../lib/messageEditing.svelte";
+  import { ReactionController } from "../../lib/reactions.svelte";
+  import { connectRealtime, WorkspaceUnavailableError, type RealtimeConnection } from "../../lib/realtime.svelte";
+  import type {
+    Channel,
+    DirectConversation,
+    Message,
+    RealtimeEvent,
+    RouteTarget,
+    Upload,
+    User,
+  } from "../../lib/types";
+
+  type Props = {
+    workspaceRouteID: string;
+    messageRouteID: string;
+  };
+
+  type ViewState = "loading" | "ready" | "auth" | "forbidden" | "not-found" | "error";
+
+  let { workspaceRouteID, messageRouteID }: Props = $props();
+
+  let viewState = $state<ViewState>("loading");
+  let errorText = $state("");
+  let user = $state<User | null>(null);
+  const reactionController = new ReactionController(() => user?.id || "");
+  const editController = new MessageEditController(revealEditSession);
+  let route = $state<RouteTarget | null>(null);
+  const thread = new ThreadController(
+    () => `${workspaceRouteID}:${messageRouteID}`,
+    reconcileThread,
+  );
+  const root = $derived(thread.root);
+  const replies = $derived(thread.replies);
+  const threadState = $derived(thread.state);
+  let directConversation = $state<DirectConversation | null>(null);
+  let parentLabel = $state("话题");
+  const replyBody = $derived(thread.draft?.body ?? "");
+  const replyTarget = $derived(thread.draft?.quote ?? null);
+  let replyInput = $state<HTMLTextAreaElement | null>(null);
+  const replyError = $derived(thread.draft?.error || thread.error || realtimeError);
+  let realtimeError = $state("");
+  const replySending = $derived(thread.draft?.sending ?? false);
+  let selectedImage = $state<{ url: string; title: string } | null>(null);
+  let socket: RealtimeConnection | null = null;
+  let loadSerial = 0;
+  let loadPending = false;
+  let workspaceMemberUsers = $state<User[]>([]);
+  let memberLoadSerial = 0;
+  let memberLoadAbort: AbortController | null = null;
+  let memberLoadError = $state("");
+
+  const replyDisabled = $derived(
+    replySending || Boolean(directConversation && !directConversation.can_send),
+  );
+  const mentionPeople = $derived.by(() => {
+    const people = new Map<string, User>();
+    for (const person of workspaceMemberUsers) {
+      if (person.id && !person.deleted_at) people.set(person.id, person);
+    }
+    for (const person of directConversation?.members ?? []) {
+      if (person.id && person.handle?.trim() && !person.deleted_at) people.set(person.id, person);
+    }
+    for (const message of root ? [root, ...replies] : replies) {
+      if (message.author?.id && message.author.handle?.trim() && !message.author.deleted_at) {
+        people.set(message.author.id, message.author);
+      }
+    }
+    if (user?.id) people.set(user.id, user);
+    return [...people.values()];
+  });
+
+  async function loadWorkspaceMembers(workspaceID: string) {
+    const serial = ++memberLoadSerial;
+    memberLoadAbort?.abort();
+    const controller = new AbortController();
+    memberLoadAbort = controller;
+    memberLoadError = "";
+    workspaceMemberUsers = [];
+    try {
+      const members = await listAllWorkspaceMembers({ workspaceID, limit: 100, signal: controller.signal });
+      if (serial === memberLoadSerial) workspaceMemberUsers = members.map((member) => member.user);
+    } catch (error) {
+      if (!controller.signal.aborted && serial === memberLoadSerial) {
+        workspaceMemberUsers = [];
+        memberLoadError = memberLoadErrorMessage(error);
+      }
+    }
+  }
+
+
+  async function revealEditSession(scope: string, session: MessageEditSession) {
+    const selection = thread.selection;
+    const current = () => scope === route?.target_id && thread.isCurrent(selection) &&
+      editController.session(scope)?.generation === session.generation;
+    if (!current()) return;
+    if (!await thread.target({ messageID: session.messageID, threadSeq: session.threadSeq }, current)) return;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await tick();
+      if (!current()) return;
+      const editor = document
+        .querySelector('[aria-label="嵌入式话题"]')
+        ?.querySelector(`[data-message-id="${CSS.escape(session.messageID)}"]`)
+        ?.querySelector<HTMLTextAreaElement>('textarea[aria-label="编辑消息"]');
+      if (!editor) continue;
+      editor.focus({ preventScroll: true });
+      return;
+    }
+  }
+
+  function applyEditedMessage(updated: MessageEdit) {
+    thread.updateMessage(updated);
+  }
+
+  function clearThread() {
+    memberLoadSerial += 1;
+    memberLoadAbort?.abort();
+    socket?.close();
+    socket = null;
+    route = null;
+    thread.close();
+    reactionController.clear();
+    editController.clear();
+    directConversation = null;
+    selectedImage = null;
+  }
+
+  function handleLoadError(error: unknown) {
+    clearThread();
+    if (error instanceof WorkspaceUnavailableError) {
+      viewState = "forbidden";
+      return;
+    }
+    if (error instanceof APIError) {
+      if (error.status === 401) {
+        viewState = "auth";
+        return;
+      }
+      if (error.status === 403) {
+        viewState = "forbidden";
+        return;
+      }
+      if (error.status === 404) {
+        viewState = "not-found";
+        return;
+      }
+    }
+    errorText = readableAPIError(error, "无法加载此话题。");
+    viewState = "error";
+  }
+
+  async function loadParent(target: RouteTarget, currentUser: User): Promise<void> {
+    if (target.parent_type === "direct") {
+      const data = await api<{ conversations: DirectConversation[] }>(
+        `/api/dms?workspace_id=${encodeURIComponent(target.workspace_id)}`,
+      );
+      let conversation = data.conversations.find((item) => item.id === target.parent_id);
+      if (!conversation) {
+        const hidden = await api<{ conversation: DirectConversation }>(
+          `/api/dms/${encodeURIComponent(target.parent_id)}`,
+        );
+        conversation = hidden.conversation;
+      }
+      directConversation = conversation;
+      parentLabel = dmTitle(conversation, currentUser.id) || "私聊";
+      return;
+    }
+    const data = await api<{ channels: Channel[] }>(
+      `/api/workspaces/${encodeURIComponent(target.workspace_id)}/channels`,
+    );
+    const channel = data.channels.find((item) => item.id === target.parent_id);
+    if (!channel) throw new APIError(404, "找不到话题所在的频道");
+    directConversation = null;
+    parentLabel = `#${channelDisplayTitle(channel)}`;
+  }
+
+  async function loadThread() {
+    if (loadPending) return;
+    loadPending = true;
+    const serial = ++loadSerial;
+    if (viewState !== "auth") viewState = "loading";
+    errorText = "";
+    try {
+      const me = await requestCurrentUser();
+      const resolved = await api<{ route: RouteTarget }>(
+        `/api/routes/${encodeURIComponent(workspaceRouteID)}/${encodeURIComponent(messageRouteID)}`,
+      );
+      if (resolved.route.target_type !== "thread") {
+        throw new APIError(404, "找不到话题路径");
+      }
+      if (serial !== loadSerial) return;
+      thread.select(resolved.route.target_id);
+      const [loaded] = await Promise.all([
+        thread.open(() => serial === loadSerial),
+        loadParent(resolved.route, me.user),
+      ]);
+      if (!loaded || serial !== loadSerial || !thread.root) return;
+      user = me.user;
+      route = resolved.route;
+      void loadWorkspaceMembers(resolved.route.workspace_id);
+      viewState = "ready";
+      connectSocket(resolved.route.workspace_id);
+    } catch (error) {
+      if (serial === loadSerial) handleLoadError(error);
+    } finally {
+      if (serial === loadSerial) loadPending = false;
+    }
+  }
+
+  function reconcileThread(freshMessages: Message[] = []) {
+    if (!root) return;
+    reactionController.seedMessages(freshMessages);
+    editController.reconcile(route?.target_id || root.id, [root, ...replies]);
+  }
+  function eventBelongsToThread(event: RealtimeEvent): boolean {
+    if (!root) return false;
+    if (event.payload.root_message_id) return event.payload.root_message_id === root.id;
+    const messageID = event.payload.message_id;
+    return messageID === root.id || replies.some((reply) => reply.id === messageID);
+  }
+
+  async function handleRealtimeEvent(event: RealtimeEvent, isCurrent: () => boolean) {
+    if (
+      eventBelongsToThread(event) &&
+      (event.type === "reaction.added" || event.type === "reaction.removed")
+    ) {
+      reactionController.applyEvent(event);
+      return;
+    }
+    await thread.handleEvent(event, isCurrent);
+  }
+
+  function reportRealtimeError(error: unknown) {
+    if (viewState === "ready") {
+      if (error instanceof WorkspaceUnavailableError || (error instanceof APIError && [401, 403, 404].includes(error.status))) {
+        handleLoadError(error);
+        return;
+      }
+      realtimeError = readableAPIError(error, "无法处理实时更新。");
+    }
+  }
+
+  function connectSocket(workspaceID: string) {
+    socket?.close();
+    socket = connectRealtime({
+      workspaceID,
+      onEvent: handleRealtimeEvent,
+      onOpen: async (isCurrent, authoritativeResync) => {
+        if (authoritativeResync) {
+          reactionController.clear();
+          await thread.refresh(isCurrent);
+        }
+        if (!isCurrent()) return;
+        realtimeError = "";
+      },
+      onError: reportRealtimeError,
+    });
+  }
+
+  async function sendReply() {
+    if (replyDisabled) return;
+    await thread.send((error) => {
+      if (error instanceof APIError && error.status === 401) handleLoadError(error);
+    });
+  }
+
+  function handleReplyKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && replyTarget) {
+      event.preventDefault();
+      thread.setQuote(null);
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendReply();
+    }
+  }
+
+  function setReplyTarget(message: Message) {
+    if (replySending) return;
+    thread.setQuote(message);
+    void tick().then(() => replyInput?.focus());
+  }
+
+  function clearReplyTarget() {
+    if (!replySending) thread.setQuote(null);
+  }
+
+  function jumpToQuote(message: Message) {
+    if (message.quoted_message_id) void thread.target({ messageID: message.quoted_message_id });
+  }
+
+  function handleInlineImagePointerUp(event: PointerEvent) {
+    const target = event.target;
+    if (!(target instanceof HTMLImageElement) || !target.closest(".markdown")) return;
+    event.preventDefault();
+    selectedImage = { url: markdownImageViewerURL(target), title: target.alt || "图片" };
+  }
+
+  function openArtifact(upload: Upload) {
+    const opened = window.open(apiResourceURL(`/api/uploads/${upload.id}`), "_blank", "noopener,noreferrer");
+    if (opened) opened.opener = null;
+  }
+
+  function retryAuthOnFocus() {
+    if (viewState === "auth" && document.visibilityState === "visible") void loadThread();
+  }
+
+  onMount(() => {
+    void loadThread();
+    window.addEventListener("focus", retryAuthOnFocus);
+    document.addEventListener("visibilitychange", retryAuthOnFocus);
+  });
+
+  onDestroy(() => {
+    loadSerial += 1;
+    memberLoadSerial += 1;
+    memberLoadAbort?.abort();
+    socket?.close();
+    window.removeEventListener("focus", retryAuthOnFocus);
+    document.removeEventListener("visibilitychange", retryAuthOnFocus);
+  });
+</script>
+
+<svelte:head>
+  <title>ClickClack 话题</title>
+  <meta name="color-scheme" content="light dark" />
+</svelte:head>
+
+{#if viewState === "ready" && root && route}
+  <main class="embed-shell">
+    <section class="thread open" aria-label="嵌入式话题">
+      <ThreadPanel
+        history={thread}
+        {root}
+        {replies}
+        {threadState}
+        {replyBody}
+        {replyTarget}
+        {mentionPeople}
+        {replyDisabled}
+        headerLabel={parentLabel}
+        headerDetail={`话题 · ${threadState?.reply_count ?? replies.length} 条回复`}
+        openHref={route.canonical_path}
+        currentUserID={user?.id}
+        {reactionController}
+        {editController}
+        editScope={route.target_id}
+        onMessageEdited={applyEditedMessage}
+        reactionsDisabled={Boolean(directConversation && !directConversation.can_send)}
+        onReplyBody={(value) => thread.updateDraft(value)}
+        onSubmitReply={() => void sendReply()}
+        onReplyKeydown={handleReplyKeydown}
+        onReplyFocus={() => {}}
+        onReplyInputRef={(node) => (replyInput = node)}
+        onSetReplyTarget={(message) => setReplyTarget(message)}
+        onClearReply={clearReplyTarget}
+        onActivateThreadComposer={() => {}}
+        onInlineImagePointerUp={handleInlineImagePointerUp}
+        onJumpToQuote={jumpToQuote}
+        onOpenImage={(url, title) => (selectedImage = { url, title })}
+        onOpenArtifact={openArtifact}
+      />
+    </section>
+    {#if memberLoadError}<p class="embed-notice" role="status">提及功能不可用：{memberLoadError}</p>{/if}
+    {#if replyError}<p class="embed-notice" role="status">{replyError}</p>{/if}
+  </main>
+{:else if viewState === "auth"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" aria-label="登录">
+      <KeystrokeMark class="embed-mark" size={42} />
+      <h1>登录 ClickClack</h1>
+      <p>请在新标签页中打开 ClickClack，登录后返回此处。面板将自动重新连接。</p>
+      <a class="embed-action" href="/app" target="_blank" rel="noopener">打开 ClickClack</a>
+    </section>
+  </main>
+{:else if viewState === "forbidden"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" role="alert">
+      <h1>话题不可用</h1>
+      <p>你尚未加入此工作区，或无权查看此话题。</p>
+    </section>
+  </main>
+{:else if viewState === "not-found"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" role="alert">
+      <h1>找不到话题</h1>
+      <p>此话题可能已被移除，或链接有误。</p>
+    </section>
+  </main>
+{:else if viewState === "error"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" role="alert">
+      <h1>无法加载此话题</h1>
+      <p>{errorText}</p>
+      <button class="embed-action" type="button" onclick={() => void loadThread()}>重试</button>
+    </section>
+  </main>
+{:else}
+  <main class="embed-state-shell" aria-label="正在加载话题">
+    <div class="embed-loading" aria-hidden="true"><span></span><span></span><span></span></div>
+  </main>
+{/if}
+
+{#if selectedImage}
+  <ImageViewer
+    url={selectedImage.url}
+    title={selectedImage.title}
+    onClose={() => (selectedImage = null)}
+  />
+{/if}
+
+<style>
+  .embed-shell {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    height: 100dvh;
+    min-width: 0;
+    overflow: hidden;
+    background: var(--panel);
+  }
+
+  .embed-shell :global(.thread) {
+    position: relative;
+    inset: auto;
+    z-index: auto;
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    max-width: none;
+    border-left: 0;
+    box-shadow: none;
+  }
+
+  .embed-shell :global(.thread > header) {
+    min-height: 44px;
+    gap: 10px;
+    padding: 6px 12px;
+  }
+
+  .embed-shell :global(.reply-composer) {
+    --composer-card-top: 6px;
+    --composer-overlay-inset-x: 14px;
+
+    padding: 6px 14px 12px;
+  }
+
+  .embed-notice {
+    flex: none;
+    margin: 0 14px 6px;
+    padding: 9px 11px;
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+    color: var(--danger);
+    font-size: 12px;
+    box-shadow: var(--shadow);
+  }
+
+  .embed-state-shell {
+    display: grid;
+    min-height: 100vh;
+    min-height: 100dvh;
+    place-items: center;
+    padding: 24px;
+    background:
+      radial-gradient(color-mix(in srgb, var(--text) 5%, transparent) 1px, transparent 1.5px) 0 0 / 18px 18px,
+      var(--bg);
+  }
+
+  .embed-state-card {
+    display: grid;
+    gap: 12px;
+    width: min(100%, 360px);
+    padding: 28px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-xl);
+    background: var(--panel);
+    box-shadow: var(--key-edge), var(--shadow);
+    text-align: center;
+  }
+
+  .embed-state-card h1,
+  .embed-state-card p {
+    margin: 0;
+  }
+
+  .embed-state-card h1 {
+    color: var(--text-strong);
+    font-family: var(--font-display);
+    font-size: 22px;
+  }
+
+  .embed-state-card p {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* :global reaches the mark component's root, which Svelte does not scope. */
+  .embed-state-card :global(.embed-mark) {
+    margin: 0 auto 2px;
+    box-shadow:
+      inset 0 0 0 1px rgba(190, 210, 255, 0.13),
+      var(--key-edge);
+  }
+
+  .embed-action {
+    display: inline-flex;
+    min-height: 40px;
+    align-items: center;
+    justify-content: center;
+    margin-top: 4px;
+    padding: 0 16px;
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: var(--accent-contrast);
+    font: inherit;
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .embed-action:hover {
+    background: var(--accent-hover);
+  }
+
+  .embed-loading {
+    display: flex;
+    gap: 7px;
+  }
+
+  .embed-loading span {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: embed-pulse 1.2s ease-in-out infinite;
+  }
+
+  .embed-loading span:nth-child(2) { animation-delay: 120ms; }
+  .embed-loading span:nth-child(3) { animation-delay: 240ms; }
+
+  @keyframes embed-pulse {
+    0%, 100% { opacity: 0.35; transform: translateY(0); }
+    50% { opacity: 1; transform: translateY(-3px); }
+  }
+</style>

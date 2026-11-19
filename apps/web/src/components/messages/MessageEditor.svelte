@@ -1,0 +1,74 @@
+<script lang="ts">
+  import { onMount, tick } from "svelte";
+  import { normalizeMessageBodyForServer } from "../../lib/messageEditing.svelte";
+
+  let {
+    body,
+    errorMessage,
+    saving,
+    onBody,
+    onCancel,
+    onSave,
+  }: {
+    body: string;
+    errorMessage: string;
+    saving: boolean;
+    onBody: (body: string) => void;
+    onCancel: () => void;
+    onSave: () => void | Promise<void>;
+  } = $props();
+
+  let textarea = $state<HTMLTextAreaElement>();
+
+  onMount(async () => {
+    await tick();
+    textarea?.focus();
+    textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
+  });
+
+  function handleKeydown(event: KeyboardEvent) {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onCancel();
+      return;
+    }
+    if (event.target === textarea && event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+      event.preventDefault();
+      void onSave();
+    }
+  }
+</script>
+
+<!-- svelte-ignore a11y_no_static_element_interactions (Delegates keys from descendant controls.) -->
+<div class="message-edit" aria-busy={saving} data-handles-escape onkeydown={handleKeydown}>
+  <textarea
+    bind:this={textarea}
+    class="message-edit__textarea"
+    value={body}
+    rows="3"
+    oninput={(event) => onBody(event.currentTarget.value)}
+    disabled={saving}
+    aria-label="编辑消息"
+    aria-keyshortcuts="Control+Enter Meta+Enter Escape"
+    aria-invalid={errorMessage ? "true" : undefined}
+    aria-describedby={errorMessage ? "message-edit-error" : undefined}
+  ></textarea>
+  <div class="message-edit__footer">
+    <button
+      type="button"
+      class="message-edit__save"
+      onclick={onSave}
+      disabled={saving || !normalizeMessageBodyForServer(body)}
+    >
+      {#if saving}正在保存…{:else}保存{/if}
+    </button>
+    <button type="button" class="message-edit__cancel" onclick={onCancel} disabled={saving}
+      >取消</button
+    >
+  </div>
+  {#if errorMessage}
+    <p id="message-edit-error" class="message-edit__error" role="alert">{errorMessage}</p>
+  {/if}
+</div>

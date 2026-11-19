@@ -1,0 +1,871 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/openclaw/clickclack/apps/api/internal/realtime"
+	"github.com/openclaw/clickclack/apps/api/internal/store"
+	sqlitestore "github.com/openclaw/clickclack/apps/api/internal/store/sqlite"
+)
+
+func TestMutationAndEphemeralEndpoints(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := sqlitestore.Open("sqlite://" + filepath.Join(dataDir, "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notifier := &recordingNotifier{}
+	server := httptest.NewServer(New(st, realtime.NewHub(), Options{UploadDir: filepath.Join(dataDir, "uploads"), PushNotifier: notifier}).Handler())
+	t.Cleanup(server.Close)
+
+	second, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Second", Email: "second@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspaces[0].ID, second.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateCurrentUser(ctx, store.UpdateCurrentUserInput{
+		UserID: second.ID,
+		NotificationSettings: &store.NotificationSettings{
+			PushoverEnabled: true,
+			PushoverUserKey: "u12345678901234567890123456789",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	updatedChannel := patchJSON[struct {
+		Channel store.Channel `json:"channel"`
+		Event   store.Event   `json:"event"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID, map[string]any{"name": "dock"})
+	if updatedChannel.Channel.Name != "dock" || updatedChannel.Event.Type != "channel.updated" {
+		t.Fatalf("unexpected channel update: %#v", updatedChannel)
+	}
+	managedChannel := postJSON[struct {
+		Channel store.Channel `json:"channel"`
+	}](t, server.URL+"/api/workspaces/"+workspaces[0].ID+"/channels", map[string]any{
+		"name":             "managed-http",
+		"display_title":    "  Managed HTTP Session  ",
+		"external_managed": true,
+		"external_ref":     "session:http",
+		"external_url":     "https://control.example.com/sessions/http",
+		"sidebar_section":  "Sessions",
+	}).Channel
+	if managedChannel.DisplayTitle == nil || *managedChannel.DisplayTitle != "Managed HTTP Session" || !managedChannel.ExternalManaged || managedChannel.ExternalRef == nil || managedChannel.ExternalURL == nil || managedChannel.SidebarSection == nil {
+		t.Fatalf("managed channel fields missing from create response: %#v", managedChannel)
+	}
+	nextDisplayTitle := "Renamed HTTP Session"
+	renamedManaged := patchJSON[struct {
+		Channel store.Channel `json:"channel"`
+	}](t, server.URL+"/api/channels/"+managedChannel.ID, map[string]any{"display_title": nextDisplayTitle}).Channel
+	if renamedManaged.DisplayTitle == nil || *renamedManaged.DisplayTitle != nextDisplayTitle {
+		t.Fatalf("display title missing from patch response: %#v", renamedManaged)
+	}
+	clear := ""
+	archivedManaged := patchJSON[struct {
+		Channel store.Channel `json:"channel"`
+		Event   store.Event   `json:"event"`
+	}](t, server.URL+"/api/channels/"+managedChannel.ID, map[string]any{
+		"archived":        true,
+		"display_title":   clear,
+		"external_ref":    clear,
+		"external_url":    clear,
+		"sidebar_section": clear,
+	})
+	if archivedManaged.Channel.ArchivedAt == nil || archivedManaged.Channel.DisplayTitle != nil || archivedManaged.Channel.ExternalRef != nil || archivedManaged.Channel.ExternalURL != nil || archivedManaged.Channel.SidebarSection != nil {
+		t.Fatalf("managed channel fields not updated through HTTP: %#v", archivedManaged.Channel)
+	}
+	if payload, ok := archivedManaged.Event.Payload.(map[string]any); !ok || payload["archived"] != true {
+		t.Fatalf("archive state missing from channel.updated metadata: %#v", archivedManaged.Event.Payload)
+	}
+	message := postJSON[struct {
+		Message store.Message `json:"message"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/messages", map[string]string{"body": "original"}).Message
+	if len(notifier.notifications) != 1 || notifier.notifications[0].RecipientKey != "u12345678901234567890123456789" {
+		t.Fatalf("expected one pushover notification, got %#v", notifier.notifications)
+	}
+	pinResult := postJSON[struct {
+		PinnedMessage store.PinnedMessage `json:"pinned_message"`
+		Event         store.Event         `json:"event"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/pins", map[string]string{"message_id": message.ID})
+	if pinResult.PinnedMessage.MessageID != message.ID || pinResult.Event.Type != "pin.added" {
+		t.Fatalf("unexpected pin response: %#v", pinResult)
+	}
+	pinned := getJSON[struct {
+		Messages []store.Message `json:"messages"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/pins")
+	if len(pinned.Messages) != 1 || pinned.Messages[0].ID != message.ID {
+		t.Fatalf("unexpected pinned messages response: %#v", pinned)
+	}
+	expectStatus(t, http.MethodPost, server.URL+"/api/channels/"+channels[0].ID+"/pins", strings.NewReader(`{`), http.StatusBadRequest)
+	expectStatus(t, http.MethodPost, server.URL+"/api/channels/"+channels[0].ID+"/pins", strings.NewReader(`{}`), http.StatusBadRequest)
+	expectStatus(t, http.MethodDelete, server.URL+"/api/channels/"+channels[0].ID+"/pins/"+message.ID, nil, http.StatusOK)
+	expectStatus(t, http.MethodDelete, server.URL+"/api/channels/"+channels[0].ID+"/pins/"+message.ID, nil, http.StatusNotFound)
+	emptyPins := getJSON[struct {
+		Messages []store.Message `json:"messages"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/pins")
+	if emptyPins.Messages == nil || len(emptyPins.Messages) != 0 {
+		t.Fatalf("expected an empty pinned messages array, got %#v", emptyPins)
+	}
+	updatedMessage := patchJSON[struct {
+		Message store.Message `json:"message"`
+		Event   store.Event   `json:"event"`
+	}](t, server.URL+"/api/messages/"+message.ID, map[string]string{"body": "edited"})
+	if updatedMessage.Message.Body != "edited" || updatedMessage.Event.Type != "message.updated" {
+		t.Fatalf("unexpected message update: %#v", updatedMessage)
+	}
+	deletedMessage := deleteJSONBody[struct {
+		Message store.Message `json:"message"`
+		Event   store.Event   `json:"event"`
+	}](t, server.URL+"/api/messages/"+message.ID)
+	if deletedMessage.Message.DeletedAt == nil || deletedMessage.Event.Type != "message.deleted" {
+		t.Fatalf("unexpected message delete: %#v", deletedMessage)
+	}
+	expectStatus(t, http.MethodPost, server.URL+"/api/channels/"+channels[0].ID+"/pins", strings.NewReader(`{"message_id":"`+message.ID+`"}`), http.StatusBadRequest)
+	ephemeral := postJSON[struct {
+		Event store.Event `json:"event"`
+	}](t, server.URL+"/api/realtime/ephemeral", map[string]any{"workspace_id": workspaces[0].ID, "channel_id": channels[0].ID, "type": "typing.started"})
+	if ephemeral.Event.Type != "typing.started" || ephemeral.Event.Cursor != "" {
+		t.Fatalf("unexpected ephemeral event: %#v", ephemeral.Event)
+	}
+	presence := postJSON[struct {
+		Event store.Event `json:"event"`
+	}](t, server.URL+"/api/realtime/ephemeral", map[string]any{"workspace_id": workspaces[0].ID, "type": "presence.changed", "payload": map[string]any{"status": "afk"}})
+	if presence.Event.Type != "presence.changed" {
+		t.Fatalf("unexpected presence event: %#v", presence.Event)
+	}
+	notifier.err = errors.New("pushover unavailable")
+	postJSON[struct {
+		Message store.Message `json:"message"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/messages", map[string]string{"body": "still succeeds"})
+	notifier.err = nil
+	updatedMe := patchJSON[struct {
+		User store.User `json:"user"`
+	}](t, server.URL+"/api/me", map[string]any{
+		"display_name": "Owner",
+		"notification_settings": map[string]any{
+			"pushover_enabled":  true,
+			"pushover_user_key": "u98765432109876543210987654321",
+		},
+	})
+	if updatedMe.User.NotificationSettings == nil || !updatedMe.User.NotificationSettings.PushoverEnabled || updatedMe.User.NotificationSettings.PushoverUserKey == "" {
+		t.Fatalf("expected profile notification settings, got %#v", updatedMe.User)
+	}
+	clearedNotifications := patchJSON[struct {
+		User store.User `json:"user"`
+	}](t, server.URL+"/api/me", map[string]any{
+		"display_name": "Owner",
+		"notification_settings": map[string]any{
+			"pushover_enabled":  false,
+			"pushover_user_key": "",
+		},
+	})
+	if clearedNotifications.User.NotificationSettings == nil || clearedNotifications.User.NotificationSettings.PushoverEnabled || clearedNotifications.User.NotificationSettings.PushoverUserKey != "" {
+		t.Fatalf("expected cleared profile notification settings, got %#v", clearedNotifications.User)
+	}
+	beforeAppearanceProfile, err := st.GetUser(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appearanceOnly := patchJSON[struct {
+		User currentUserPayload `json:"user"`
+	}](t, server.URL+"/api/me", map[string]any{
+		"appearance_preferences": map[string]any{
+			"color_mode":     "dark",
+			"board_theme":    "moss",
+			"message_layout": "outlined",
+			"density":        "compact",
+		},
+	})
+	if appearanceOnly.User.AppearancePreferences == nil ||
+		appearanceOnly.User.AppearancePreferences.ColorMode != "dark" ||
+		appearanceOnly.User.AppearancePreferences.BoardTheme != "moss" ||
+		appearanceOnly.User.AppearancePreferences.MessageLayout != "outlined" ||
+		appearanceOnly.User.AppearancePreferences.Density != "compact" {
+		t.Fatalf("appearance preferences missing from update response: %#v", appearanceOnly.User)
+	}
+	if appearanceOnly.User.DisplayName != beforeAppearanceProfile.DisplayName ||
+		appearanceOnly.User.Handle != beforeAppearanceProfile.Handle ||
+		appearanceOnly.User.AvatarURL != beforeAppearanceProfile.AvatarURL {
+		t.Fatalf("appearance-only update changed profile: before=%#v after=%#v", beforeAppearanceProfile, appearanceOnly.User.User)
+	}
+	partialAppearance := patchJSON[struct {
+		User currentUserPayload `json:"user"`
+	}](t, server.URL+"/api/me", map[string]any{
+		"appearance_preferences": map[string]any{"board_theme": "signal"},
+	})
+	if partialAppearance.User.AppearancePreferences == nil ||
+		partialAppearance.User.AppearancePreferences.ColorMode != "dark" ||
+		partialAppearance.User.AppearancePreferences.BoardTheme != "" ||
+		partialAppearance.User.AppearancePreferences.MessageLayout != "outlined" ||
+		partialAppearance.User.AppearancePreferences.Density != "compact" {
+		t.Fatalf("appearance partial merge lost fields: %#v", partialAppearance.User.AppearancePreferences)
+	}
+	meWithAppearance := getJSON[struct {
+		User currentUserPayload `json:"user"`
+	}](t, server.URL+"/api/me")
+	if meWithAppearance.User.AppearancePreferences == nil || meWithAppearance.User.AppearancePreferences.Density != "compact" {
+		t.Fatalf("GET /api/me omitted persisted appearance preferences: %#v", meWithAppearance.User)
+	}
+
+	beforeFailedProfile, err := st.GetUser(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectStatus(t, http.MethodPatch, server.URL+"/api/me", strings.NewReader(`{"display_name":"Leaky","notification_settings":{"pushover_enabled":true,"pushover_user_key":"bad"}}`), http.StatusBadRequest)
+	afterFailedProfile, err := st.GetUser(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFailedProfile.DisplayName != beforeFailedProfile.DisplayName || afterFailedProfile.NotificationSettings == nil || beforeFailedProfile.NotificationSettings == nil || afterFailedProfile.NotificationSettings.PushoverUserKey != beforeFailedProfile.NotificationSettings.PushoverUserKey {
+		t.Fatalf("failed profile update partially applied: before=%#v after=%#v", beforeFailedProfile, afterFailedProfile)
+	}
+	expectStatus(t, http.MethodPatch, server.URL+"/api/me", strings.NewReader(`{"display_name":"Leaky","appearance_preferences":{"density":"roomy"}}`), http.StatusBadRequest)
+	afterFailedAppearance, err := st.GetUser(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persistedAppearance, err := st.GetAppearancePreferences(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFailedAppearance.DisplayName != beforeFailedProfile.DisplayName || persistedAppearance == nil || persistedAppearance.Density != "compact" {
+		t.Fatalf("failed appearance update partially applied: user=%#v appearance=%#v", afterFailedAppearance, persistedAppearance)
+	}
+
+	secondBoard := "iris"
+	if _, err := st.UpdateCurrentUser(ctx, store.UpdateCurrentUserInput{
+		UserID:                second.ID,
+		AppearancePreferences: &store.AppearancePreferencesPatch{BoardTheme: &secondBoard},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	memberPage := getJSON[map[string]any](t, server.URL+"/api/workspaces/"+workspaces[0].ID+"/members")
+	encodedMemberPage, err := json.Marshal(memberPage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(encodedMemberPage, []byte("appearance_preferences")) {
+		t.Fatalf("appearance preferences leaked through member payload: %s", encodedMemberPage)
+	}
+	expectStatus(t, http.MethodPatch, server.URL+"/api/channels/"+channels[0].ID, bytes.NewReader([]byte(`{`)), http.StatusBadRequest)
+	expectStatus(t, http.MethodPatch, server.URL+"/api/channels/missing", bytes.NewReader([]byte(`{"name":"missing"}`)), http.StatusBadRequest)
+	expectStatus(t, http.MethodPatch, server.URL+"/api/messages/"+message.ID, bytes.NewReader([]byte(`{`)), http.StatusBadRequest)
+	expectStatus(t, http.MethodPatch, server.URL+"/api/messages/"+message.ID, bytes.NewReader([]byte(`{"body":" "}`)), http.StatusBadRequest)
+	expectStatus(t, http.MethodDelete, server.URL+"/api/messages/missing", nil, http.StatusBadRequest)
+	expectStatus(t, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{`)), http.StatusBadRequest)
+	expectStatus(t, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspaces[0].ID+`","type":"bad"}`)), http.StatusBadRequest)
+	expectStatus(t, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"missing","type":"typing.started"}`)), http.StatusForbidden)
+}
+
+func TestDeletePinnedMessagePublishesPinRemovalBeforeDeletion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := sqlitestore.Open("sqlite://" + filepath.Join(dataDir, "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "pin-delete-http@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil || len(channels) == 0 {
+		t.Fatalf("expected a channel, got %v: %v", channels, err)
+	}
+	hub := realtime.NewHub()
+	server := httptest.NewServer(New(st, hub, Options{UploadDir: filepath.Join(dataDir, "uploads")}).Handler())
+	t.Cleanup(server.Close)
+
+	message := postJSON[struct {
+		Message store.Message `json:"message"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/messages", map[string]string{"body": "delete pinned over http"}).Message
+	postJSON[struct {
+		PinnedMessage store.PinnedMessage `json:"pinned_message"`
+		Event         store.Event         `json:"event"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/pins", map[string]string{"message_id": message.ID})
+
+	cursor, err := st.LatestEventCursor(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, _, err := websocket.Dial(ctx, strings.Replace(server.URL, "http://", "ws://", 1)+"/api/realtime/ws?workspace_id="+workspaces[0].ID+"&after_cursor="+cursor, &websocket.DialOptions{HTTPHeader: http.Header{"X-ClickClack-User": []string{owner.ID}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.CloseNow()
+	deleted := deleteJSONBody[struct {
+		Message store.Message `json:"message"`
+		Event   store.Event   `json:"event"`
+	}](t, server.URL+"/api/messages/"+message.ID)
+	if deleted.Message.DeletedAt == nil || deleted.Event.Type != "message.deleted" {
+		t.Fatalf("unexpected delete response: %#v", deleted)
+	}
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	for index, want := range []string{"pin.removed", "message.deleted"} {
+		_, body, err := conn.Read(readCtx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var event store.Event
+		if err := json.Unmarshal(body, &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type != want || event.Payload == nil {
+			t.Fatalf("event %d: expected %s with payload, got %#v", index, want, event)
+		}
+	}
+
+	pinned := getJSON[struct {
+		Messages []store.Message `json:"messages"`
+	}](t, server.URL+"/api/channels/"+channels[0].ID+"/pins")
+	if len(pinned.Messages) != 0 {
+		t.Fatalf("expected deleted message to be absent from pins, got %#v", pinned.Messages)
+	}
+}
+
+func TestDirectTypingEphemeralIsLimitedToConversationMembers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := sqlitestore.Open("sqlite://" + filepath.Join(dataDir, "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stranger, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Stranger", Email: "stranger@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := workspaces[0]
+	channels, err := st.ListChannels(ctx, workspace.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(channels) == 0 {
+		t.Fatal("expected default channel")
+	}
+	for _, userID := range []string{member.ID, stranger.ID} {
+		if err := st.AddWorkspaceMember(ctx, workspace.ID, userID, "member"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "guest-ephemeral@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{
+		WorkspaceID: workspace.ID,
+		UserID:      owner.ID,
+		MemberIDs:   []string{member.ID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hub := realtime.NewHub()
+	server := httptest.NewServer(New(st, hub, Options{UploadDir: filepath.Join(dataDir, "uploads")}).Handler())
+	t.Cleanup(server.Close)
+
+	ownerConn := dialRealtimeAsUser(t, server.URL, workspace.ID, owner.ID)
+	defer ownerConn.CloseNow()
+	memberConn := dialRealtimeAsUser(t, server.URL, workspace.ID, member.ID)
+	defer memberConn.CloseNow()
+	strangerConn := dialRealtimeAsUser(t, server.URL, workspace.ID, stranger.ID)
+	defer strangerConn.CloseNow()
+
+	ephemeral := postJSONAsUser[struct {
+		Event store.Event `json:"event"`
+	}](t, owner.ID, server.URL+"/api/realtime/ephemeral", map[string]any{
+		"workspace_id":           workspace.ID,
+		"direct_conversation_id": dm.ID,
+		"type":                   "typing.started",
+	})
+	if ephemeral.Event.Type != "typing.started" || ephemeral.Event.ChannelID != "" {
+		t.Fatalf("unexpected dm typing event: %#v", ephemeral.Event)
+	}
+	if payload, ok := ephemeral.Event.Payload.(map[string]any); !ok || payload["direct_conversation_id"] != dm.ID || payload["user_id"] != owner.ID {
+		t.Fatalf("unexpected dm typing payload: %#v", ephemeral.Event.Payload)
+	}
+
+	if event, ok := readEventTypeWithin(t, ownerConn, "typing.started", time.Second); !ok || event.ID != ephemeral.Event.ID {
+		t.Fatalf("owner should receive own dm typing event, got %#v ok=%v", event, ok)
+	}
+	if event, ok := readEventTypeWithin(t, memberConn, "typing.started", time.Second); !ok || event.ID != ephemeral.Event.ID {
+		t.Fatalf("dm member should receive dm typing event, got %#v ok=%v", event, ok)
+	}
+	if event, ok := readEventTypeWithin(t, strangerConn, "typing.started", 150*time.Millisecond); ok {
+		t.Fatalf("workspace non-member received private dm typing event: %#v", event)
+	}
+
+	channelEphemeral := postJSONAsUser[struct {
+		Event store.Event `json:"event"`
+	}](t, owner.ID, server.URL+"/api/realtime/ephemeral", map[string]any{
+		"workspace_id": workspace.ID,
+		"channel_id":   channels[0].ID,
+		"type":         "typing.started",
+	})
+	if channelEphemeral.Event.ChannelID != channels[0].ID {
+		t.Fatalf("unexpected channel typing event: %#v", channelEphemeral.Event)
+	}
+	expectStatusAsUser(t, owner.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","type":"typing.started","payload":{"channel_id":"`+channels[0].ID+`"}}`)), http.StatusBadRequest)
+	blocked := true
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, TargetUserID: member.ID, Blocked: &blocked}); err != nil {
+		t.Fatal(err)
+	}
+	expectStatusAsUser(t, member.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","channel_id":"`+channels[0].ID+`","type":"typing.started"}`)), http.StatusForbidden)
+	expectStatusAsUser(t, member.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","direct_conversation_id":"`+dm.ID+`","type":"typing.started"}`)), http.StatusForbidden)
+	expectStatusAsUser(t, member.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","type":"presence.changed"}`)), http.StatusForbidden)
+	expectStatusAsUser(t, guest.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","channel_id":"`+channels[0].ID+`","type":"typing.started"}`)), http.StatusForbidden)
+	expectStatusAsUser(t, guest.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","type":"typing.started","payload":{"channel_id":"`+channels[0].ID+`"}}`)), http.StatusForbidden)
+	expectStatus(t, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","channel_id":"chn_missing","type":"typing.started"}`)), http.StatusForbidden)
+	expectStatus(t, http.MethodPost, server.URL+"/api/realtime/ephemeral", bytes.NewReader([]byte(`{"workspace_id":"`+workspace.ID+`","direct_conversation_id":"`+dm.ID+`","channel_id":"chn_any","type":"typing.started"}`)), http.StatusBadRequest)
+	reqBody := bytes.NewReader([]byte(`{"workspace_id":"` + workspace.ID + `","direct_conversation_id":"` + dm.ID + `","type":"typing.started"}`))
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/api/realtime/ephemeral", reqBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-ClickClack-User", stranger.ID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected non-member publish forbidden, got %s", resp.Status)
+	}
+}
+
+func TestOwnersAndAuthorsCanDeleteMessages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := sqlitestore.Open("sqlite://" + filepath.Join(dataDir, "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner-admin-delete@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := workspaces[0]
+	channels, err := st.ListChannels(ctx, workspace.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := channels[0]
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "moderator-admin-delete@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "member-admin-delete@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherMember, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Other", Email: "other-admin-delete@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct {
+		userID string
+		role   string
+	}{
+		{moderator.ID, store.WorkspaceRoleModerator},
+		{member.ID, store.WorkspaceRoleMember},
+		{otherMember.ID, store.WorkspaceRoleMember},
+	} {
+		if err := st.AddWorkspaceMember(ctx, workspace.ID, entry.userID, entry.role); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server := httptest.NewServer(New(st, realtime.NewHub(), Options{UploadDir: filepath.Join(dataDir, "uploads")}).Handler())
+	t.Cleanup(server.Close)
+
+	ownMessage := postJSONAsUser[struct {
+		Message store.Message `json:"message"`
+	}](t, member.ID, server.URL+"/api/channels/"+channel.ID+"/messages", map[string]string{"body": "author can remove this"}).Message
+	deletedByAuthor := deleteJSONBodyAsUser[struct {
+		Message store.Message `json:"message"`
+		Event   store.Event   `json:"event"`
+	}](t, member.ID, server.URL+"/api/messages/"+ownMessage.ID)
+	if deletedByAuthor.Message.DeletedAt == nil || deletedByAuthor.Event.Type != "message.deleted" {
+		t.Fatalf("unexpected author delete payload: %#v", deletedByAuthor)
+	}
+
+	secondMemberMessage := postJSONAsUser[struct {
+		Message store.Message `json:"message"`
+	}](t, member.ID, server.URL+"/api/channels/"+channel.ID+"/messages", map[string]string{"body": "owner can remove this"}).Message
+	deletedByOwner := deleteJSONBodyAsUser[struct {
+		Message store.Message `json:"message"`
+		Event   store.Event   `json:"event"`
+	}](t, owner.ID, server.URL+"/api/messages/"+secondMemberMessage.ID)
+	if deletedByOwner.Message.DeletedAt == nil || deletedByOwner.Event.Type != "message.deleted" {
+		t.Fatalf("unexpected owner delete payload: %#v", deletedByOwner)
+	}
+
+	thirdMemberMessage := postJSONAsUser[struct {
+		Message store.Message `json:"message"`
+	}](t, member.ID, server.URL+"/api/channels/"+channel.ID+"/messages", map[string]string{"body": "moderator cannot remove this"}).Message
+	expectStatusAsUser(t, moderator.ID, http.MethodDelete, server.URL+"/api/messages/"+thirdMemberMessage.ID, nil, http.StatusForbidden)
+
+	fourthMemberMessage := postJSONAsUser[struct {
+		Message store.Message `json:"message"`
+	}](t, member.ID, server.URL+"/api/channels/"+channel.ID+"/messages", map[string]string{"body": "member cannot remove this"}).Message
+	expectStatusAsUser(t, otherMember.ID, http.MethodDelete, server.URL+"/api/messages/"+fourthMemberMessage.ID, nil, http.StatusForbidden)
+
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspace.ID, UserID: owner.ID, MemberIDs: []string{member.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dmMessage := postJSONAsUser[struct {
+		Message store.Message `json:"message"`
+	}](t, member.ID, server.URL+"/api/dms/"+dm.ID+"/messages", map[string]string{"body": "dm author only delete"}).Message
+	expectStatusAsUser(t, owner.ID, http.MethodDelete, server.URL+"/api/messages/"+dmMessage.ID, nil, http.StatusForbidden)
+	deletedByDMAuthor := deleteJSONBodyAsUser[struct {
+		Message store.Message `json:"message"`
+		Event   store.Event   `json:"event"`
+	}](t, member.ID, server.URL+"/api/messages/"+dmMessage.ID)
+	if deletedByDMAuthor.Message.DeletedAt == nil || deletedByDMAuthor.Event.Type != "message.deleted" {
+		t.Fatalf("unexpected dm author delete payload: %#v", deletedByDMAuthor)
+	}
+}
+
+func TestChannelTypingEphemeralRequiresVisibleChannel(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := sqlitestore.Open("sqlite://" + filepath.Join(dataDir, "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "typing-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "typing-guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guestChannelID, generalChannelID string
+	for _, channel := range channels {
+		switch channel.Name {
+		case "guest":
+			guestChannelID = channel.ID
+		case "general":
+			generalChannelID = channel.ID
+		}
+	}
+	if guestChannelID == "" || generalChannelID == "" {
+		t.Fatalf("expected guest and general channels, got %#v", channels)
+	}
+	server := httptest.NewServer(New(st, realtime.NewHub(), Options{UploadDir: filepath.Join(dataDir, "uploads")}).Handler())
+	t.Cleanup(server.Close)
+
+	expectStatusAsUser(t, moderator.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", strings.NewReader(`{"workspace_id":"`+workspace.ID+`","type":"typing.started","payload":{"channel_id":"`+generalChannelID+`"}}`), http.StatusBadRequest)
+	expectStatusAsUser(t, guest.ID, http.MethodPost, server.URL+"/api/realtime/ephemeral", strings.NewReader(`{"workspace_id":"`+workspace.ID+`","channel_id":"`+generalChannelID+`","type":"typing.started"}`), http.StatusForbidden)
+
+	ephemeral := postJSONAsUser[struct {
+		Event store.Event `json:"event"`
+	}](t, moderator.ID, server.URL+"/api/realtime/ephemeral", map[string]any{
+		"workspace_id": workspace.ID,
+		"channel_id":   guestChannelID,
+		"type":         "typing.started",
+		"payload": map[string]any{
+			"channel_id":              generalChannelID,
+			"direct_conversation_id":  "dcn_spoof",
+			"client_ephemeral_status": "typing",
+		},
+	})
+	if ephemeral.Event.ChannelID != guestChannelID {
+		t.Fatalf("expected canonical channel_id, got %#v", ephemeral.Event)
+	}
+	payload, ok := ephemeral.Event.Payload.(map[string]any)
+	if !ok {
+		t.Fatalf("unexpected payload type: %#v", ephemeral.Event.Payload)
+	}
+	if payload["channel_id"] != guestChannelID || payload["direct_conversation_id"] != nil || payload["user_id"] != moderator.ID {
+		t.Fatalf("unexpected canonical payload: %#v", payload)
+	}
+}
+
+func dialRealtimeAsUser(t *testing.T, serverURL, workspaceID, userID string) *websocket.Conn {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wsURL := strings.Replace(serverURL, "http://", "ws://", 1) + "/api/realtime/ws?workspace_id=" + url.QueryEscape(workspaceID)
+	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"X-ClickClack-User": []string{userID}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+func readEventTypeWithin(t *testing.T, conn *websocket.Conn, eventType string, timeout time.Duration) (store.Event, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for {
+		_, body, err := conn.Read(ctx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return store.Event{}, false
+			}
+			t.Fatal(err)
+		}
+		var event store.Event
+		if err := json.Unmarshal(body, &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == eventType {
+			return event, true
+		}
+	}
+}
+
+func TestPushNotificationsRespectModerationVisibility(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := sqlitestore.Open("sqlite://" + filepath.Join(dataDir, "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "push-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "push-guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateCurrentUser(ctx, store.UpdateCurrentUserInput{
+		UserID: guest.ID,
+		NotificationSettings: &store.NotificationSettings{
+			PushoverEnabled: true,
+			PushoverUserKey: "g12345678901234567890123456789",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guestChannelID, generalChannelID string
+	for _, channel := range channels {
+		switch channel.Name {
+		case "guest":
+			guestChannelID = channel.ID
+		case "general":
+			generalChannelID = channel.ID
+		}
+	}
+	if guestChannelID == "" || generalChannelID == "" {
+		t.Fatalf("expected guest and general channels, got %#v", channels)
+	}
+	notifier := &recordingNotifier{}
+	server := New(st, realtime.NewHub(), Options{PushNotifier: notifier})
+	hidden, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: moderator.ID, Body: "hidden"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.notifyMessageCreated(ctx, hidden, nil)
+	if len(notifier.notifications) != 0 {
+		t.Fatalf("guest should not receive hidden channel push notifications: %#v", notifier.notifications)
+	}
+	visible, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: guestChannelID, AuthorID: moderator.ID, Body: "visible"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.notifyMessageCreated(ctx, visible, nil)
+	if len(notifier.notifications) != 1 || notifier.notifications[0].RecipientKey != "g12345678901234567890123456789" {
+		t.Fatalf("guest should receive guest channel push notification, got %#v", notifier.notifications)
+	}
+
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "push-member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateCurrentUser(ctx, store.UpdateCurrentUserInput{
+		UserID: member.ID,
+		NotificationSettings: &store.NotificationSettings{
+			PushoverEnabled: true,
+			PushoverUserKey: "m12345678901234567890123456789",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspace.ID, UserID: moderator.ID, MemberIDs: []string{member.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: member.ID, Role: store.WorkspaceRoleGuest}); err != nil {
+		t.Fatal(err)
+	}
+	notifier.notifications = nil
+	dmMessage, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: dm.ID, AuthorID: moderator.ID, Body: "hidden dm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.notifyMessageCreated(ctx, dmMessage, nil)
+	if len(notifier.notifications) != 0 {
+		t.Fatalf("demoted guest should not receive DM push notifications: %#v", notifier.notifications)
+	}
+}
+
+type recordingNotifier struct {
+	notifications []PushNotification
+	err           error
+}
+
+func (r *recordingNotifier) Notify(_ context.Context, notification PushNotification) error {
+	r.notifications = append(r.notifications, notification)
+	return r.err
+}
+
+func patchJSON[T any](t *testing.T, endpoint string, body any) T {
+	t.Helper()
+	payload, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPatch, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return doJSON[T](t, req)
+}
+
+func deleteJSONBody[T any](t *testing.T, endpoint string) T {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return doJSON[T](t, req)
+}
+
+func deleteJSONBodyAsUser[T any](t *testing.T, userID, endpoint string) T {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-ClickClack-User", userID)
+	return doJSON[T](t, req)
+}
+
+func doJSON[T any](t *testing.T, req *http.Request) T {
+	t.Helper()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		t.Fatalf("%s %s: %s", req.Method, req.URL, resp.Status)
+	}
+	var out T
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}

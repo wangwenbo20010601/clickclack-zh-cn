@@ -1,0 +1,718 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/openclaw/clickclack/apps/api/internal/store"
+	"github.com/openclaw/clickclack/apps/api/internal/store/storetest"
+)
+
+func TestGuestWaitingRoomModeration(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	bystander, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Bystander", Email: "bystander@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, bystander.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	peerModerator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Peer Moderator", Email: "peer-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, peerModerator.ID, store.WorkspaceRoleModerator); err != nil {
+		t.Fatal(err)
+	}
+	adminBot, _, err := st.CreateBot(ctx, store.CreateBotInput{WorkspaceID: workspace.ID, DisplayName: "Admin Bot", Scopes: []string{"bot:admin"}, CreatedBy: moderator.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	guestChannels, err := st.ListChannels(ctx, workspace.ID, guest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(guestChannels) != 1 || guestChannels[0].Name != "guest" {
+		t.Fatalf("guest should only see #guest, got %#v", guestChannels)
+	}
+	moderatorChannels, err := st.ListChannels(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(moderatorChannels) < 2 {
+		t.Fatalf("moderator should see waiting and approved rooms, got %#v", moderatorChannels)
+	}
+	var guestChannelID, generalChannelID string
+	for _, channel := range moderatorChannels {
+		switch channel.Name {
+		case "guest":
+			guestChannelID = channel.ID
+		case "general":
+			generalChannelID = channel.ID
+		}
+	}
+	if guestChannelID == "" || generalChannelID == "" {
+		t.Fatalf("expected guest and general channels, got %#v", moderatorChannels)
+	}
+
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: guest.ID, Body: "let me in"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected guest to be blocked from #general, got %v", err)
+	}
+	if _, _, err := st.MarkChannelRead(ctx, generalChannelID, guest.ID, 1); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected guest to be blocked from hidden channel reads, got %v", err)
+	}
+	beforeHidden, err := st.ListEventsAfter(ctx, workspace.ID, guest.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursorBeforeHidden := lastEventCursor(beforeHidden)
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: moderator.ID, Body: "hidden event"}); err != nil {
+		t.Fatal(err)
+	}
+	var firstGuestMessage store.Message
+	for i := 0; i < store.GuestPostLimit; i++ {
+		message, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: guestChannelID, AuthorID: guest.ID, Body: "waiting"})
+		if err != nil {
+			t.Fatalf("guest post %d failed: %v", i+1, err)
+		}
+		if i == 0 {
+			firstGuestMessage = message
+		}
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: firstGuestMessage.ID, UserID: guest.ID}); err != nil {
+		t.Fatalf("guest should be able to delete own visible waiting-room post, got %v", err)
+	}
+	visibleEvents, err := st.ListEventsAfter(ctx, workspace.ID, guest.ID, cursorBeforeHidden, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visibleEvents) != 1 || visibleEvents[0].ChannelID != guestChannelID {
+		t.Fatalf("expected event page limit to apply after access filtering, got %#v", visibleEvents)
+	}
+	if _, _, err := st.MarkChannelRead(ctx, guestChannelID, guest.ID, 1); err != nil {
+		t.Fatalf("expected guest channel read to succeed, got %v", err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: guestChannelID, AuthorID: guest.ID, Body: "too much"}); !errors.Is(err, store.ErrPostRateLimited) {
+		t.Fatalf("expected guest post limit, got %v", err)
+	}
+
+	members, err := st.ListWorkspaceMembers(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guestModeration store.MemberModeration
+	for _, member := range members {
+		if member.User.ID == guest.ID {
+			guestModeration = member
+		}
+	}
+	if guestModeration.Role != store.WorkspaceRoleGuest || guestModeration.PostsRemaining != 0 || guestModeration.PostLimit != store.GuestPostLimit {
+		t.Fatalf("unexpected guest moderation state: %#v", guestModeration)
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: guest.ID, TargetUserID: moderator.ID, Role: store.WorkspaceRoleGuest}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected guest moderation denial, got %v", err)
+	}
+	blocked := true
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: peerModerator.ID, Blocked: &blocked}); err == nil {
+		t.Fatal("expected peer moderator moderation to fail")
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: adminBot.ID, Blocked: &blocked}); err == nil {
+		t.Fatal("expected bot moderation by moderator to fail")
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: guest.ID, Role: "blocked"}); err == nil {
+		t.Fatal("expected invalid moderation role to fail")
+	}
+	_, approvalEvent, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: guest.ID, Role: store.WorkspaceRoleMember, ClearTimeout: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(approvalEvent.RecipientUserIDs) == 0 {
+		t.Fatalf("expected recipient-scoped moderation event, got %#v", approvalEvent)
+	}
+	bystanderEvents, err := st.ListEventsAfter(ctx, workspace.ID, bystander.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range bystanderEvents {
+		if event.ID == approvalEvent.ID {
+			t.Fatalf("moderation event leaked to unrelated guest: %#v", event)
+		}
+	}
+	targetEvents, err := st.ListEventsAfter(ctx, workspace.ID, guest.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eventListContains(targetEvents, approvalEvent.ID) {
+		t.Fatalf("target did not receive moderation event: %#v", targetEvents)
+	}
+	guestChannels, err = st.ListChannels(ctx, workspace.ID, guest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(guestChannels) < 2 {
+		t.Fatalf("approved guest should see more rooms, got %#v", guestChannels)
+	}
+	var approvedMessage store.Message
+	for i := 0; i < 2; i++ {
+		message, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: guest.ID, Body: "approved"})
+		if err != nil {
+			t.Fatalf("approved post %d failed: %v", i+1, err)
+		}
+		if i == 0 {
+			approvedMessage = message
+		}
+	}
+
+	timeoutUntil := time.Now().Add(time.Hour).In(time.FixedZone("plus-one", 3600)).Format(time.RFC3339)
+	note := "watch carefully"
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: guest.ID, TimeoutUntil: &timeoutUntil, ModerationNote: &note}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: guest.ID, Body: "timed out"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected timeout to block posts, got %v", err)
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: guest.ID, ClearTimeout: true, Blocked: &blocked}); err != nil {
+		t.Fatal(err)
+	}
+	members, err = st.ListWorkspaceMembers(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, member := range members {
+		if member.User.ID == guest.ID && member.ModerationNote != note {
+			t.Fatalf("partial moderation update cleared note: %#v", member)
+		}
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: guest.ID, Body: "blocked"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected block to stop posts, got %v", err)
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: approvedMessage.ID, UserID: guest.ID, Body: "blocked edit"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected block to stop edits, got %v", err)
+	}
+	if _, err := st.AddReaction(ctx, store.CreateReactionInput{MessageID: approvedMessage.ID, UserID: guest.ID, Emoji: "+1"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected block to stop reactions, got %v", err)
+	}
+	if _, _, err := st.CreateChannel(ctx, store.CreateChannelInput{WorkspaceID: workspace.ID, Name: "escape", Kind: "public", UserID: guest.ID}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected block to stop channel creation, got %v", err)
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: generalChannelID, UserID: guest.ID, Name: "renamed"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected block to stop channel updates, got %v", err)
+	}
+	if _, err := storetest.CreateUpload(ctx, st, store.CreateUploadInput{WorkspaceID: workspace.ID, OwnerID: guest.ID, Filename: "blocked.txt", ContentType: "text/plain", ByteSize: 7, StoragePath: "blocked.txt"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected block to stop upload creation, got %v", err)
+	}
+	blocked = false
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: guest.ID, ClearTimeout: true, Blocked: &blocked}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: guest.ID, Body: "back"}); err != nil {
+		t.Fatalf("expected unblock to restore posting, got %v", err)
+	}
+}
+
+func eventListContains(events []store.Event, eventID string) bool {
+	for _, event := range events {
+		if event.ID == eventID {
+			return true
+		}
+	}
+	return false
+}
+
+func lastEventCursor(events []store.Event) string {
+	if len(events) == 0 {
+		return ""
+	}
+	return events[len(events)-1].Cursor
+}
+
+func TestGuestWorkspaceRoleSyncRevokesModeratorOrgRole(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	user, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Mod", Email: "revoked-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, user.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Role != store.WorkspaceRoleModerator {
+		t.Fatalf("expected moderator role, got %#v", workspace)
+	}
+	workspace, err = st.EnsureDefaultGuestWorkspaceMember(ctx, user.ID, store.WorkspaceRoleGuest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Role != store.WorkspaceRoleGuest {
+		t.Fatalf("expected revoked moderator to become guest, got %#v", workspace)
+	}
+
+	workspace, err = st.EnsureDefaultGuestWorkspaceMember(ctx, user.ID, store.WorkspaceRoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Role != store.WorkspaceRoleMember {
+		t.Fatalf("expected approved member role, got %#v", workspace)
+	}
+	workspace, err = st.EnsureDefaultGuestWorkspaceMember(ctx, user.ID, store.WorkspaceRoleGuest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.Role != store.WorkspaceRoleMember {
+		t.Fatalf("expected approved member to remain member, got %#v", workspace)
+	}
+}
+
+func TestBlockedModeratorCannotModerate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	owner, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Owner", Email: "owner-block-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, owner.ID, store.WorkspaceRoleOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "blocked-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator); err != nil {
+		t.Fatal(err)
+	}
+	timedModerator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Timed Moderator", Email: "timed-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, timedModerator.ID, store.WorkspaceRoleModerator); err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "blocked-mod-guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+
+	blocked := true
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, TargetUserID: moderator.ID, Blocked: &blocked}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ListWorkspaceMembers(ctx, workspace.ID, moderator.ID); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected blocked moderator to lose roster access, got %v", err)
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: guest.ID, Role: store.WorkspaceRoleMember}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected blocked moderator to lose moderation powers, got %v", err)
+	}
+	blockEventNote := "blocked moderator should not see this"
+	_, blockEvent, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, TargetUserID: guest.ID, Role: store.WorkspaceRoleMember, ModerationNote: &blockEventNote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedModeratorEvents, err := st.ListEventsAfter(ctx, workspace.ID, moderator.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eventListContains(blockedModeratorEvents, blockEvent.ID) {
+		t.Fatalf("blocked moderator received private moderation event: %#v", blockedModeratorEvents)
+	}
+	timeoutUntil := time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano)
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, TargetUserID: timedModerator.ID, TimeoutUntil: &timeoutUntil}); err != nil {
+		t.Fatal(err)
+	}
+	timeoutEventNote := "timed moderator should not see this"
+	_, timeoutEvent, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, TargetUserID: guest.ID, ModerationNote: &timeoutEventNote})
+	if err != nil {
+		t.Fatal(err)
+	}
+	timedModeratorEvents, err := st.ListEventsAfter(ctx, workspace.ID, timedModerator.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eventListContains(timedModeratorEvents, timeoutEvent.ID) {
+		t.Fatalf("timed-out moderator received private moderation event: %#v", timedModeratorEvents)
+	}
+}
+
+func TestGuestPostBudgetIgnoresPreDemotionMemberPosts(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "budget-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "budget-member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guestChannelID, generalChannelID string
+	for _, channel := range channels {
+		switch channel.Name {
+		case "guest":
+			guestChannelID = channel.ID
+		case "general":
+			generalChannelID = channel.ID
+		}
+	}
+	if guestChannelID == "" || generalChannelID == "" {
+		t.Fatalf("expected guest and general channels, got %#v", channels)
+	}
+	for i := 0; i < store.GuestPostLimit; i++ {
+		if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: member.ID, Body: "before demotion"}); err != nil {
+			t.Fatalf("member post %d failed: %v", i+1, err)
+		}
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: member.ID, Role: store.WorkspaceRoleGuest}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: guestChannelID, AuthorID: member.ID, Body: "first waiting-room post"}); err != nil {
+		t.Fatalf("pre-demotion member posts should not consume guest budget, got %v", err)
+	}
+}
+
+func TestMessageNonceRecoveryFollowsCurrentAccess(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "nonce-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "nonce-member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var generalChannelID, guestChannelID string
+	for _, channel := range channels {
+		switch channel.Name {
+		case "general":
+			generalChannelID = channel.ID
+		case "guest":
+			guestChannelID = channel.ID
+		}
+	}
+	if generalChannelID == "" || guestChannelID == "" {
+		t.Fatalf("expected general and guest channels, got %#v", channels)
+	}
+	general, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: member.ID, Body: "before demotion", Nonce: "nonce-replay"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: guestChannelID, AuthorID: member.ID, Body: "waiting room", Nonce: "guest-nonce"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspace.ID, UserID: member.ID, MemberIDs: []string{moderator.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: dm.ID, AuthorID: member.ID, Body: "direct before demotion", Nonce: "direct-nonce"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name    string
+		message store.Message
+		denied  bool
+	}{
+		{"channel", general, true},
+		{"direct", direct, true},
+		{"guest channel", guest, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" before demotion", func(t *testing.T) {
+			if got, err := st.GetMessageByNonce(ctx, member.ID, " "+tc.message.Nonce+" "); err != nil || got.ID != tc.message.ID {
+				t.Fatalf("expected sender to recover message %s, got %s: %v", tc.message.ID, got.ID, err)
+			}
+			if _, err := st.GetMessageByNonce(ctx, moderator.ID, tc.message.Nonce); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("expected other author's nonce to be hidden, got %v", err)
+			}
+		})
+	}
+	for _, nonce := range []string{"", "missing"} {
+		if _, err := st.GetMessageByNonce(ctx, member.ID, nonce); !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("expected absent nonce %q to return no rows, got %v", nonce, err)
+		}
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: member.ID, Role: store.WorkspaceRoleGuest}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" after demotion", func(t *testing.T) {
+			var wantErr error
+			if tc.denied {
+				wantErr = store.ErrModerationRestricted
+			}
+			if _, err := st.GetMessage(ctx, tc.message.ID, member.ID); !errors.Is(err, wantErr) {
+				t.Fatalf("unexpected message access after demotion: %v", err)
+			}
+			got, err := st.GetMessageByNonce(ctx, member.ID, tc.message.Nonce)
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("expected nonce recovery error %v, got %v", wantErr, err)
+			}
+			if !tc.denied && got.ID != tc.message.ID {
+				t.Fatalf("expected permitted message %s, got %s", tc.message.ID, got.ID)
+			}
+		})
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: member.ID, Body: "before demotion", Nonce: "nonce-replay"}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected replayed hidden channel nonce to be blocked, got %v", err)
+	}
+}
+
+func TestDemotedGuestCannotUseExistingDirectConversation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "dm-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "dm-member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspace.ID, UserID: moderator.ID, MemberIDs: []string{member.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: dm.ID, AuthorID: moderator.ID, Body: "before demotion"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: moderator.ID, TargetUserID: member.ID, Role: store.WorkspaceRoleGuest}); err != nil {
+		t.Fatal(err)
+	}
+	mustExecSQL(t, ctx, st, `INSERT INTO events (id, cursor, workspace_id, channel_id, type, seq, payload_json, created_at, is_private) VALUES ('evt_legacy_dm_message', 'cur_legacy_dm_message', ?, NULL, 'message.updated', NULL, ?, '2026-01-01T00:00:00Z', 1)`, workspace.ID, `{"message_id":"`+message.ID+`","author_id":"`+moderator.ID+`"}`)
+	mustExecSQL(t, ctx, st, `INSERT INTO event_recipients (event_id, user_id) VALUES ('evt_legacy_dm_message', ?)`, member.ID)
+	if _, err := st.ResolveRouteTarget(ctx, member.ID, workspace.RouteID, dm.RouteID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected demoted guest direct route to be hidden, got %v", err)
+	}
+	if _, err := st.GetMessage(ctx, message.ID, member.ID); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected demoted guest to be blocked from DM message, got %v", err)
+	}
+	if _, err := st.ListDirectMessages(ctx, dm.ID, member.ID, store.MessagePageRequest{}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected demoted guest to be blocked from DM history, got %v", err)
+	}
+	if _, _, err := st.MarkDirectRead(ctx, dm.ID, member.ID, 1); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected demoted guest to be blocked from DM read receipts, got %v", err)
+	}
+	events, err := st.ListEventsAfter(ctx, workspace.ID, member.ID, "", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		payload, _ := event.Payload.(map[string]any)
+		if payload["direct_conversation_id"] == dm.ID || event.ID == "evt_legacy_dm_message" {
+			t.Fatalf("direct event leaked to demoted guest: %#v", event)
+		}
+	}
+}
+
+func TestGuestSearchOnlyReturnsWaitingRoomMessages(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "search-mod@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, moderator.ID, store.WorkspaceRoleModerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guest, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Guest", Email: "search-guest@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.EnsureDefaultGuestWorkspaceMember(ctx, guest.ID, store.WorkspaceRoleGuest); err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspace.ID, moderator.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guestChannelID, generalChannelID string
+	for _, channel := range channels {
+		switch channel.Name {
+		case "guest":
+			guestChannelID = channel.ID
+		case "general":
+			generalChannelID = channel.ID
+		}
+	}
+	if guestChannelID == "" || generalChannelID == "" {
+		t.Fatalf("expected guest and general channels, got %#v", channels)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: generalChannelID, AuthorID: moderator.ID, Body: "needle hidden"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: guestChannelID, AuthorID: guest.ID, Body: "needle public"}); err != nil {
+		t.Fatal(err)
+	}
+
+	results, err := st.SearchMessagePage(ctx, store.SearchPageRequest{
+		WorkspaceID: workspace.ID,
+		UserID:      guest.ID,
+		Query:       "needle",
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results.Results) != 1 || results.Results[0].ChannelID != guestChannelID {
+		t.Fatalf("guest search leaked hidden messages: %#v", results)
+	}
+	if _, err := st.SearchMessagePage(ctx, store.SearchPageRequest{
+		WorkspaceID: workspace.ID,
+		ChannelID:   generalChannelID,
+		UserID:      guest.ID,
+		Query:       "needle",
+		Limit:       10,
+	}); !errors.Is(err, store.ErrModerationRestricted) {
+		t.Fatalf("expected explicit hidden channel search to fail, got %v", err)
+	}
+}
+
+func TestModerationHydrationFailureRollsBack(t *testing.T) {
+	ctx, st, owner, workspace, _ := seededStore(t)
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "hydrate-member@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.LatestEventCursor(ctx, workspace.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Only guest quota hydration needs this table; moderation authorization and writes still work.
+	if _, err := st.db.ExecContext(ctx, `DROP TABLE slash_command_invocations`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateMemberModeration(ctx, store.UpdateMemberModerationInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, TargetUserID: member.ID, Role: store.WorkspaceRoleGuest}); err == nil {
+		t.Fatal("expected quota hydration failure")
+	}
+	role, err := st.memberRole(ctx, workspace.ID, member.ID)
+	if err != nil || role != store.WorkspaceRoleMember {
+		t.Fatalf("failed moderation committed role %q: %v", role, err)
+	}
+	after, err := st.LatestEventCursor(ctx, workspace.ID, owner.ID)
+	if err != nil || after != before {
+		t.Fatalf("failed moderation committed an event: before=%s after=%s error=%v", before, after, err)
+	}
+}
+
+func TestCreateMessageRejectsArchivedChannel(t *testing.T) {
+	ctx := t.Context()
+	st := newTestStore(t)
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "archived-owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workspaces) == 0 {
+		t.Fatal("expected a workspace")
+	}
+	workspace := workspaces[0]
+	channels, err := st.ListChannels(ctx, workspace.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(channels) == 0 {
+		t.Fatal("expected a channel")
+	}
+	channel := channels[0]
+	root, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channel.ID, AuthorID: owner.ID, Body: "before archive"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived := true
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, Archived: &archived}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channel.ID, AuthorID: owner.ID, Body: "blocked"}); !errors.Is(err, store.ErrChannelArchived) {
+		t.Fatalf("expected ErrChannelArchived, got %v", err)
+	}
+	if _, _, _, err := st.CreateThreadReply(ctx, store.CreateThreadReplyInput{RootMessageID: root.ID, AuthorID: owner.ID, Body: "blocked reply"}); !errors.Is(err, store.ErrChannelArchived) {
+		t.Fatalf("expected archived reply rejection, got %v", err)
+	}
+	archived = false
+	restored, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, Archived: &archived})
+	if err != nil || restored.ID != channel.ID {
+		t.Fatalf("restore must preserve channel ID: channel=%+v err=%v", restored, err)
+	}
+	if _, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channel.ID, AuthorID: owner.ID, Body: "restored"}); err != nil {
+		t.Fatalf("restored channel must accept messages: %v", err)
+	}
+}

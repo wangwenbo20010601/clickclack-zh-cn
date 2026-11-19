@@ -1,0 +1,2069 @@
+-- name: InsertMagicLink :exec
+INSERT INTO auth_magic_links (id, token, token_hash, email, display_name, created_at, expires_at)
+VALUES (sqlc.arg(id), sqlc.arg(token), sqlc.arg(token_hash), sqlc.arg(email), sqlc.arg(display_name), sqlc.arg(created_at), sqlc.arg(expires_at));
+
+-- name: GetMagicLinkByToken :one
+SELECT id, token, token_hash, email, display_name, created_at, expires_at, used_at
+FROM auth_magic_links
+WHERE token_hash = sqlc.arg(token_hash);
+
+-- name: MarkMagicLinkUsed :execrows
+UPDATE auth_magic_links
+SET used_at = sqlc.arg(used_at)
+WHERE id = sqlc.arg(id)
+  AND used_at IS NULL
+  AND (
+    CASE
+      WHEN strpos(expires_at, '.') = 0 THEN replace(expires_at, 'Z', '.000000000Z')
+      ELSE substring(expires_at from 1 for strpos(expires_at, '.')) ||
+           substring(substring(expires_at from strpos(expires_at, '.') + 1 for strpos(expires_at, 'Z') - strpos(expires_at, '.') - 1) || '000000000' from 1 for 9) ||
+           'Z'
+    END
+  ) > (
+    CASE
+      WHEN strpos(sqlc.arg(now)::text, '.') = 0 THEN replace(sqlc.arg(now)::text, 'Z', '.000000000Z')
+      ELSE substring(sqlc.arg(now)::text from 1 for strpos(sqlc.arg(now)::text, '.')) ||
+           substring(substring(sqlc.arg(now)::text from strpos(sqlc.arg(now)::text, '.') + 1 for strpos(sqlc.arg(now)::text, 'Z') - strpos(sqlc.arg(now)::text, '.') - 1) || '000000000' from 1 for 9) ||
+           'Z'
+    END
+  );
+
+-- name: GetSessionUser :one
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at, s.expires_at AS session_expires_at,
+       COALESCE(uns.pushover_enabled, 0) AS pushover_enabled,
+       COALESCE(uns.pushover_user_key, '') AS pushover_user_key
+FROM sessions s
+JOIN users u ON u.id = s.user_id
+LEFT JOIN user_notification_settings uns ON uns.user_id = u.id
+WHERE s.token_hash = sqlc.arg(token_hash)
+  AND s.revoked_at IS NULL;
+
+-- name: InsertSession :exec
+INSERT INTO sessions (id, token, token_hash, user_id, created_at, expires_at)
+VALUES (sqlc.arg(id), sqlc.arg(token), sqlc.arg(token_hash), sqlc.arg(user_id), sqlc.arg(created_at), sqlc.arg(expires_at));
+
+-- name: DeleteExpiredOAuthTransactions :execrows
+DELETE FROM oauth_transactions
+WHERE expires_at_unix <= sqlc.arg(now_unix);
+
+-- name: CountOAuthTransactions :one
+SELECT COUNT(*)
+FROM oauth_transactions;
+
+-- name: CountOAuthTransactionsForBinding :one
+SELECT COUNT(*)
+FROM oauth_transactions
+WHERE browser_binding_hash = sqlc.arg(browser_binding_hash);
+
+-- name: InsertOAuthTransaction :exec
+INSERT INTO oauth_transactions (
+  id, state_hash, browser_binding_hash, mode, pkce_verifier, desktop_challenge,
+  desktop_protocol, created_at_unix, expires_at_unix
+) VALUES (
+  sqlc.arg(id), sqlc.arg(state_hash), sqlc.arg(browser_binding_hash), sqlc.arg(mode),
+  sqlc.arg(pkce_verifier), sqlc.arg(desktop_challenge), sqlc.arg(desktop_protocol),
+  sqlc.arg(created_at_unix), sqlc.arg(expires_at_unix)
+);
+
+-- name: GetOAuthTransactionForConsume :one
+SELECT id, state_hash, browser_binding_hash, mode, pkce_verifier, desktop_challenge,
+       desktop_protocol, created_at_unix, expires_at_unix
+FROM oauth_transactions
+WHERE state_hash = sqlc.arg(state_hash)
+FOR UPDATE;
+
+-- name: DeleteOAuthTransaction :execrows
+DELETE FROM oauth_transactions
+WHERE id = sqlc.arg(id) AND state_hash = sqlc.arg(state_hash);
+
+-- name: DeleteExpiredDesktopOAuthGrants :execrows
+DELETE FROM desktop_oauth_grants
+WHERE expires_at_unix <= sqlc.arg(now_unix);
+
+-- name: CountDesktopOAuthGrants :one
+SELECT COUNT(*)
+FROM desktop_oauth_grants;
+
+-- name: InsertDesktopOAuthGrant :exec
+INSERT INTO desktop_oauth_grants (
+  id, grant_hash, user_id, desktop_challenge, created_at_unix, expires_at_unix
+) VALUES (
+  sqlc.arg(id), sqlc.arg(grant_hash), sqlc.arg(user_id), sqlc.arg(desktop_challenge),
+  sqlc.arg(created_at_unix), sqlc.arg(expires_at_unix)
+);
+
+-- name: GetDesktopOAuthGrantForConsume :one
+SELECT id, grant_hash, user_id, desktop_challenge, created_at_unix, expires_at_unix
+FROM desktop_oauth_grants
+WHERE grant_hash = sqlc.arg(grant_hash)
+FOR UPDATE;
+
+-- name: DeleteDesktopOAuthGrant :execrows
+DELETE FROM desktop_oauth_grants
+WHERE id = sqlc.arg(id) AND grant_hash = sqlc.arg(grant_hash);
+
+-- name: GetUserByIdentityEmail :one
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at
+FROM identities i
+JOIN users u ON u.id = i.user_id
+WHERE i.email = sqlc.arg(email)
+ORDER BY u.created_at
+LIMIT 1;
+
+-- Case-insensitive twin of GetUserByIdentityEmail. Identity rows keep the
+-- casing they were created with (admin user create stores the address as
+-- given), so an exact match cannot find them from a normalized lookup.
+-- name: ListUsersByIdentityEmailFold :many
+SELECT DISTINCT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at
+FROM identities i
+JOIN users u ON u.id = i.user_id
+WHERE lower(i.email) = lower(sqlc.arg(email))
+ORDER BY u.created_at, u.id
+LIMIT 2;
+
+-- name: LockIdentityProviderSubject :exec
+SELECT pg_advisory_xact_lock(hashtext('clickclack.identity.' || sqlc.arg(provider)::text), hashtext(sqlc.arg(provider_subject)::text));
+
+-- name: GetUserByIdentityProviderSubject :one
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at
+FROM identities i
+JOIN users u ON u.id = i.user_id
+WHERE i.provider = sqlc.arg(provider)
+  AND i.provider_subject = sqlc.arg(provider_subject)
+FOR UPDATE OF u;
+
+-- name: ListIdentitySyncUsers :many
+SELECT u.id, u.kind, u.display_name, u.handle, u.avatar_url,
+       i.provider, i.provider_subject, i.email
+FROM users u
+JOIN identities i ON i.user_id = u.id
+WHERE u.id IN (
+  SELECT candidate.user_id FROM identities candidate
+  WHERE candidate.provider = sqlc.arg(source)
+     OR lower(candidate.email) IN (SELECT jsonb_array_elements_text(CAST(sqlc.arg(emails) AS jsonb)))
+)
+ORDER BY u.id, i.id
+FOR UPDATE OF u, i;
+
+-- name: InsertHumanUser :exec
+INSERT INTO users (id, display_name, avatar_url, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(display_name), sqlc.arg(avatar_url), sqlc.arg(created_at));
+
+-- name: GetIdentityEmailForUser :one
+SELECT email
+FROM identities
+WHERE user_id = sqlc.arg(user_id)
+  AND email <> ''
+ORDER BY created_at, id
+LIMIT 1;
+
+-- name: ListUsersMissingAvatar :many
+SELECT u.id AS user_id, i.email
+FROM users u
+JOIN identities i ON i.id = (
+  SELECT candidate.id
+  FROM identities candidate
+  WHERE candidate.user_id = u.id
+    AND candidate.email <> ''
+  ORDER BY candidate.created_at, candidate.id
+  LIMIT 1
+)
+WHERE u.kind = 'human'
+  AND u.avatar_url = ''
+ORDER BY u.id;
+
+-- name: SetUserAvatarIfEmpty :exec
+UPDATE users
+SET avatar_url = sqlc.arg(avatar_url)
+WHERE id = sqlc.arg(id)
+  AND avatar_url = '';
+
+-- Avatar URLs equal to the generated fallback remain fallback-equivalent.
+-- name: SetProviderAvatarUnlessExplicit :exec
+UPDATE users
+SET avatar_url = sqlc.arg(avatar_url)
+WHERE id = sqlc.arg(id)
+  AND (avatar_url = '' OR avatar_url = sqlc.arg(fallback_url));
+
+-- name: UpdateIdentityEmailIfEmpty :exec
+UPDATE identities
+SET email = sqlc.arg(email)
+WHERE provider = sqlc.arg(provider)
+  AND provider_subject = sqlc.arg(provider_subject)
+  AND email = '';
+
+-- name: InsertIdentity :exec
+INSERT INTO identities (id, user_id, provider, provider_subject, email, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(user_id), sqlc.arg(provider), sqlc.arg(provider_subject), sqlc.arg(email), sqlc.arg(created_at));
+
+-- name: FirstUser :one
+SELECT id, kind, owner_user_id, display_name, handle, avatar_url, created_at
+FROM users
+ORDER BY created_at
+LIMIT 1;
+
+-- name: GetUser :one
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+       COALESCE(tombstone.former_handle, '') AS former_handle,
+       COALESCE(tombstone.deleted_at, '') AS deleted_at
+FROM users u
+LEFT JOIN bot_tombstones tombstone ON tombstone.bot_user_id = u.id
+WHERE u.id = sqlc.arg(id);
+
+-- name: UpdateUserProfile :exec
+UPDATE users
+SET display_name = sqlc.arg(display_name),
+    handle = sqlc.arg(handle),
+    avatar_url = sqlc.arg(avatar_url)
+WHERE id = sqlc.arg(id);
+
+-- name: UpdateUserDisplayName :exec
+UPDATE users
+SET display_name = sqlc.arg(display_name)
+WHERE id = sqlc.arg(id);
+
+-- name: UpdateUserHandle :exec
+UPDATE users
+SET handle = sqlc.arg(handle)
+WHERE id = sqlc.arg(id);
+
+-- name: UpdateUserAvatar :exec
+UPDATE users
+SET avatar_url = sqlc.arg(avatar_url)
+WHERE id = sqlc.arg(id);
+
+-- name: UpdateWorkspaceMemberSortKeys :exec
+UPDATE workspace_members
+SET sort_name = lower(COALESCE(NULLIF(sqlc.arg(display_name), ''), NULLIF(sqlc.arg(handle), ''), user_id)),
+    sort_handle = lower(COALESCE(NULLIF(sqlc.arg(handle), ''), user_id))
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: UpsertNotificationSettings :exec
+INSERT INTO user_notification_settings (user_id, pushover_enabled, pushover_user_key)
+VALUES (sqlc.arg(user_id), sqlc.arg(pushover_enabled), sqlc.arg(pushover_user_key))
+ON CONFLICT(user_id) DO UPDATE SET
+  pushover_enabled = excluded.pushover_enabled,
+  pushover_user_key = excluded.pushover_user_key;
+
+-- name: GetNotificationSettings :one
+SELECT pushover_enabled, pushover_user_key
+FROM user_notification_settings
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: GetAppearancePreferences :one
+SELECT color_mode, board_theme, message_layout, density
+FROM user_appearance_preferences
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: EnsureAppearancePreferences :exec
+INSERT INTO user_appearance_preferences (user_id)
+VALUES (sqlc.arg(user_id))
+ON CONFLICT(user_id) DO NOTHING;
+
+-- name: UpdateAppearanceColorMode :exec
+UPDATE user_appearance_preferences
+SET color_mode = sqlc.arg(color_mode)
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: UpdateAppearanceBoardTheme :exec
+UPDATE user_appearance_preferences
+SET board_theme = sqlc.arg(board_theme)
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: UpdateAppearanceMessageLayout :exec
+UPDATE user_appearance_preferences
+SET message_layout = sqlc.arg(message_layout)
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: UpdateAppearanceDensity :exec
+UPDATE user_appearance_preferences
+SET density = sqlc.arg(density)
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: ListSidebarChannelOrder :many
+SELECT workspace_id, channel_ids
+FROM user_sidebar_channel_order
+WHERE user_id = sqlc.arg(user_id)
+ORDER BY workspace_id;
+
+-- name: UpsertSidebarChannelOrder :exec
+INSERT INTO user_sidebar_channel_order (user_id, workspace_id, channel_ids, updated_at)
+VALUES (sqlc.arg(user_id), sqlc.arg(workspace_id), sqlc.arg(channel_ids), sqlc.arg(updated_at))
+ON CONFLICT(user_id, workspace_id) DO UPDATE SET
+  channel_ids = excluded.channel_ids,
+  updated_at = excluded.updated_at;
+
+-- name: ListWorkspaceChannelIDs :many
+SELECT id
+FROM channels
+WHERE workspace_id = sqlc.arg(workspace_id)
+ORDER BY id;
+
+-- name: UpsertChannelNotificationSettings :exec
+INSERT INTO channel_notification_settings (channel_id, user_id, preference, created_at, updated_at)
+VALUES (sqlc.arg(channel_id), sqlc.arg(user_id), sqlc.arg(preference), sqlc.arg(created_at), sqlc.arg(updated_at))
+ON CONFLICT(channel_id, user_id) DO UPDATE SET
+  preference = excluded.preference,
+  updated_at = excluded.updated_at;
+
+-- name: GetChannelNotificationPreference :one
+SELECT preference
+FROM channel_notification_settings
+WHERE channel_id = sqlc.arg(channel_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: ListMentionedUserIDs :many
+SELECT u.id, lower(u.handle) AS handle
+FROM users u
+JOIN workspace_members wm ON wm.user_id = u.id
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND NULLIF(BTRIM(u.handle), '') IS NOT NULL
+  AND lower(u.handle) = ANY(sqlc.arg(handles)::text[])
+ORDER BY u.id;
+
+-- name: ListWorkspacePushNotificationRecipients :many
+SELECT u.id AS user_id, u.display_name,
+       CASE WHEN COALESCE(uns.pushover_enabled, 0) = 1 THEN COALESCE(uns.pushover_user_key, '') ELSE '' END AS pushover_user_key,
+       COALESCE(cns.preference, 'all') AS notification_preference,
+       EXISTS (SELECT 1 FROM user_push_subscriptions ups WHERE ups.user_id = u.id) AS has_push_subscription
+FROM workspace_members wm
+JOIN users u ON u.id = wm.user_id
+LEFT JOIN user_notification_settings uns ON uns.user_id = u.id
+LEFT JOIN channel_notification_settings cns
+  ON cns.channel_id = sqlc.arg(channel_id) AND cns.user_id = u.id
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND u.id <> sqlc.arg(author_id)
+  AND (
+    (COALESCE(uns.pushover_enabled, 0) = 1 AND COALESCE(uns.pushover_user_key, '') <> '')
+    OR EXISTS (SELECT 1 FROM user_push_subscriptions ups WHERE ups.user_id = u.id)
+  )
+ORDER BY u.id;
+
+-- name: ListDirectPushNotificationRecipients :many
+SELECT u.id AS user_id, u.display_name,
+       CASE WHEN COALESCE(uns.pushover_enabled, 0) = 1 THEN COALESCE(uns.pushover_user_key, '') ELSE '' END AS pushover_user_key,
+       EXISTS (SELECT 1 FROM user_push_subscriptions ups WHERE ups.user_id = u.id) AS has_push_subscription
+FROM direct_conversation_members dcm
+JOIN direct_conversations dc ON dc.id = dcm.conversation_id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+JOIN users u ON u.id = dcm.user_id
+LEFT JOIN user_notification_settings uns ON uns.user_id = u.id
+WHERE dcm.conversation_id = sqlc.arg(conversation_id)
+  AND u.id <> sqlc.arg(author_id)
+  AND (
+    (COALESCE(uns.pushover_enabled, 0) = 1 AND COALESCE(uns.pushover_user_key, '') <> '')
+    OR EXISTS (SELECT 1 FROM user_push_subscriptions ups WHERE ups.user_id = u.id)
+  )
+ORDER BY u.id;
+
+-- name: InsertInvite :exec
+INSERT INTO invites (id, workspace_id, token, created_by, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(token), sqlc.arg(created_by), sqlc.arg(created_at));
+
+-- name: InsertWorkspaceMember :execrows
+INSERT INTO workspace_members (
+  workspace_id, user_id, role, created_at, role_sort, sort_name, sort_handle
+)
+VALUES (
+  sqlc.arg(workspace_id),
+  sqlc.arg(user_id),
+  sqlc.arg(role),
+  sqlc.arg(created_at),
+  CASE sqlc.arg(role) WHEN 'owner' THEN 0 WHEN 'moderator' THEN 1 WHEN 'member' THEN 2 WHEN 'bot' THEN 3 WHEN 'guest' THEN 4 ELSE 9 END,
+  COALESCE(
+    (SELECT lower(COALESCE(NULLIF(display_name, ''), NULLIF(handle, ''), id)) FROM users WHERE id = sqlc.arg(user_id)),
+    lower(sqlc.arg(user_id))
+  ),
+  COALESCE(
+    (SELECT lower(COALESCE(NULLIF(handle, ''), id)) FROM users WHERE id = sqlc.arg(user_id)),
+    lower(sqlc.arg(user_id))
+  )
+)
+ON CONFLICT DO NOTHING;
+
+-- name: UpsertGuestWorkspaceMemberRole :exec
+INSERT INTO workspace_members (
+  workspace_id, user_id, role, created_at, role_sort, sort_name, sort_handle
+)
+VALUES (
+  sqlc.arg(workspace_id),
+  sqlc.arg(user_id),
+  sqlc.arg(role),
+  sqlc.arg(created_at),
+  CASE sqlc.arg(role) WHEN 'owner' THEN 0 WHEN 'moderator' THEN 1 WHEN 'member' THEN 2 WHEN 'bot' THEN 3 WHEN 'guest' THEN 4 ELSE 9 END,
+  COALESCE(
+    (SELECT lower(COALESCE(NULLIF(display_name, ''), NULLIF(handle, ''), id)) FROM users WHERE id = sqlc.arg(user_id)),
+    lower(sqlc.arg(user_id))
+  ),
+  COALESCE(
+    (SELECT lower(COALESCE(NULLIF(handle, ''), id)) FROM users WHERE id = sqlc.arg(user_id)),
+    lower(sqlc.arg(user_id))
+  )
+)
+ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+  role = CASE
+    WHEN workspace_members.role = 'owner' THEN workspace_members.role
+    WHEN excluded.role = 'moderator' THEN excluded.role
+    WHEN workspace_members.role = 'moderator' THEN excluded.role
+    WHEN workspace_members.role = 'member' AND excluded.role = 'moderator' THEN excluded.role
+    WHEN workspace_members.role = 'guest' AND excluded.role IN ('member', 'moderator') THEN excluded.role
+    ELSE workspace_members.role
+  END,
+  role_sort = CASE
+    WHEN workspace_members.role = 'owner' THEN 0
+    WHEN excluded.role = 'moderator' THEN 1
+    WHEN workspace_members.role = 'moderator' THEN CASE excluded.role WHEN 'owner' THEN 0 WHEN 'moderator' THEN 1 WHEN 'member' THEN 2 WHEN 'bot' THEN 3 WHEN 'guest' THEN 4 ELSE 9 END
+    WHEN workspace_members.role = 'member' AND excluded.role = 'moderator' THEN 1
+    WHEN workspace_members.role = 'guest' AND excluded.role IN ('member', 'moderator') THEN CASE excluded.role WHEN 'moderator' THEN 1 ELSE 2 END
+    ELSE workspace_members.role_sort
+  END,
+  sort_name = excluded.sort_name,
+  sort_handle = excluded.sort_handle;
+
+-- name: InsertDefaultWorkspaceMember :exec
+INSERT INTO workspace_members (
+  workspace_id, user_id, role, created_at, role_sort, sort_name, sort_handle
+)
+VALUES (
+  sqlc.arg(workspace_id),
+  sqlc.arg(user_id),
+  sqlc.arg(role),
+  sqlc.arg(created_at),
+  CASE sqlc.arg(role) WHEN 'owner' THEN 0 WHEN 'moderator' THEN 1 WHEN 'member' THEN 2 WHEN 'bot' THEN 3 WHEN 'guest' THEN 4 ELSE 9 END,
+  COALESCE(
+    (SELECT lower(COALESCE(NULLIF(display_name, ''), NULLIF(handle, ''), id)) FROM users WHERE id = sqlc.arg(user_id)),
+    lower(sqlc.arg(user_id))
+  ),
+  COALESCE(
+    (SELECT lower(COALESCE(NULLIF(handle, ''), id)) FROM users WHERE id = sqlc.arg(user_id)),
+    lower(sqlc.arg(user_id))
+  )
+)
+ON CONFLICT DO NOTHING;
+
+-- name: FirstWorkspace :one
+SELECT id, COALESCE(route_id, '') AS route_id, name, slug, icon_url, created_at
+FROM workspaces
+ORDER BY created_at
+LIMIT 1;
+
+-- name: GetWorkspaceByRouteID :one
+SELECT id, COALESCE(route_id, '') AS route_id, name, slug, icon_url, created_at
+FROM workspaces
+WHERE route_id = sqlc.arg(route_id);
+
+-- name: ListWorkspaces :many
+SELECT w.id, COALESCE(w.route_id, '') AS route_id, w.name, w.slug, w.icon_url, w.created_at, wm.role
+FROM workspaces w
+JOIN workspace_members wm ON wm.workspace_id = w.id
+WHERE wm.user_id = sqlc.arg(user_id)
+ORDER BY w.created_at;
+
+-- name: InsertWorkspace :exec
+INSERT INTO workspaces (id, route_id, name, slug, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(route_id), sqlc.arg(name), sqlc.arg(slug), sqlc.arg(created_at));
+
+-- name: GetWorkspace :one
+SELECT w.id, COALESCE(w.route_id, '') AS route_id, w.name, w.slug, w.icon_url, w.created_at, wm.role
+FROM workspaces w
+JOIN workspace_members wm ON wm.workspace_id = w.id
+WHERE w.id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(user_id);
+
+-- name: LockWorkspaceForUpdate :exec
+SELECT id FROM workspaces WHERE id = sqlc.arg(workspace_id) FOR UPDATE;
+
+-- name: UpdateWorkspace :exec
+UPDATE workspaces
+SET name = sqlc.arg(name),
+    slug = sqlc.arg(slug),
+    icon_url = sqlc.arg(icon_url)
+WHERE id = sqlc.arg(id);
+
+-- name: ListWorkspaceUploadStoragePaths :many
+SELECT storage_path
+FROM uploads
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND storage_path <> '';
+
+-- name: ListWorkspaceActiveServiceBotIDs :many
+SELECT DISTINCT u.id
+FROM users u
+JOIN (
+  SELECT wm.user_id AS bot_user_id
+  FROM workspace_members wm
+  WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT bt.bot_user_id
+  FROM bot_tokens bt
+  WHERE bt.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT bc.bot_user_id
+  FROM bot_commands bc
+  WHERE bc.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT ai.bot_user_id
+  FROM app_installations ai
+  WHERE ai.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT sc.bot_user_id
+  FROM slash_commands sc
+  WHERE sc.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT ai.bot_user_id
+  FROM event_subscriptions es
+  JOIN app_installations ai ON ai.id = es.app_installation_id
+  WHERE es.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT ca.user_id
+  FROM connected_accounts ca
+  WHERE ca.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT m.author_id
+  FROM messages m
+  WHERE m.workspace_id = sqlc.arg(workspace_id)
+  UNION
+  SELECT dcm.user_id
+  FROM direct_conversations dc
+  JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+  WHERE dc.workspace_id = sqlc.arg(workspace_id)
+) AS referenced ON referenced.bot_user_id = u.id
+WHERE u.kind = 'bot'
+  AND u.owner_user_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM bot_tombstones tombstone WHERE tombstone.bot_user_id = u.id
+  )
+ORDER BY u.id;
+
+-- name: ListWorkspaceActiveBotMemberIDs :many
+SELECT u.id
+FROM users u
+JOIN workspace_members wm ON wm.user_id = u.id
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND u.kind = 'bot'
+  AND NOT EXISTS (
+    SELECT 1 FROM bot_tombstones tombstone WHERE tombstone.bot_user_id = u.id
+  )
+ORDER BY u.id;
+
+-- name: InsertPendingUploadCleanup :one
+INSERT INTO pending_upload_cleanups (id, workspace_id, storage_path, created_at, updated_at)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(storage_path), sqlc.arg(created_at), sqlc.arg(updated_at))
+ON CONFLICT(storage_path) DO UPDATE
+SET workspace_id = excluded.workspace_id,
+    updated_at = excluded.updated_at
+RETURNING id, workspace_id, storage_path, attempts, last_error, created_at, updated_at;
+
+-- name: ListPendingUploadCleanups :many
+SELECT id, workspace_id, storage_path, attempts, last_error, created_at, updated_at
+FROM pending_upload_cleanups
+ORDER BY updated_at, id
+LIMIT sqlc.arg(row_limit);
+
+-- name: DeletePendingUploadCleanup :exec
+DELETE FROM pending_upload_cleanups
+WHERE id = sqlc.arg(id);
+
+-- name: RecordPendingUploadCleanupFailure :exec
+UPDATE pending_upload_cleanups
+SET attempts = attempts + 1,
+    last_error = sqlc.arg(last_error),
+    updated_at = sqlc.arg(updated_at)
+WHERE id = sqlc.arg(id);
+
+-- name: DeleteWorkspace :execrows
+DELETE FROM workspaces
+WHERE id = sqlc.arg(id);
+
+-- name: InsertDefaultChannel :exec
+INSERT INTO channels (id, route_id, workspace_id, name, kind, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(route_id), sqlc.arg(workspace_id), 'general', 'public', sqlc.arg(created_at));
+
+-- name: InsertChannel :exec
+INSERT INTO channels (id, route_id, workspace_id, name, display_title, kind, created_at, external_managed, external_ref, external_url, sidebar_section)
+VALUES (sqlc.arg(id), sqlc.arg(route_id), sqlc.arg(workspace_id), sqlc.arg(name), sqlc.arg(display_title), sqlc.arg(kind), sqlc.arg(created_at), sqlc.arg(external_managed), sqlc.arg(external_ref), sqlc.arg(external_url), sqlc.arg(sidebar_section));
+
+-- name: ListChannels :many
+SELECT c.id, COALESCE(c.route_id, '') AS route_id, c.workspace_id, c.name, c.display_title, c.kind, c.created_at, c.archived_at,
+       c.external_managed, c.external_ref, c.external_url, c.sidebar_section,
+       CAST(COALESCE((SELECT MAX(channel_seq) FROM messages WHERE channel_id = c.id AND parent_message_id IS NULL), 0) AS BIGINT) AS last_seq,
+       CAST(COALESCE((SELECT cr.last_read_seq FROM channel_reads cr WHERE cr.channel_id = c.id AND cr.user_id = sqlc.arg(reader_user_id)), 0) AS BIGINT) AS last_read_seq,
+       CAST(COALESCE((
+         SELECT COUNT(*)
+         FROM messages m
+         WHERE m.channel_id = c.id
+           AND m.parent_message_id IS NULL
+           AND m.author_id <> sqlc.arg(reader_user_id)
+           AND m.kind = 'message'
+           AND m.channel_seq > COALESCE((SELECT cr2.last_read_seq FROM channel_reads cr2 WHERE cr2.channel_id = c.id AND cr2.user_id = sqlc.arg(reader_user_id)), 0)
+       ), 0) AS BIGINT) AS unread_count
+FROM channels c
+WHERE c.workspace_id = sqlc.arg(workspace_id)
+ORDER BY c.name;
+
+-- name: RequireMembership :one
+SELECT 1
+FROM workspace_members wm
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(user_id)
+FOR KEY SHARE OF wm;
+
+-- name: RequireMembershipRole :one
+SELECT wm.role
+FROM workspace_members wm
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(user_id)
+FOR KEY SHARE OF wm;
+
+-- name: RequireWorkspaceManager :one
+SELECT wm.role
+FROM workspace_members wm
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(user_id)
+  AND wm.role IN ('owner', 'moderator')
+FOR KEY SHARE OF wm;
+
+-- name: RequireWorkspaceOwner :one
+SELECT wm.role
+FROM workspace_members wm
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(user_id)
+  AND wm.role = 'owner'
+FOR KEY SHARE OF wm;
+
+-- name: MembershipRolesForUpdate :many
+SELECT user_id, role
+FROM workspace_members
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND user_id IN (sqlc.arg(actor_user_id), sqlc.arg(target_user_id))
+ORDER BY user_id
+FOR UPDATE;
+
+-- name: UserHasNonGuestMembership :one
+SELECT workspace_id
+FROM workspace_members
+WHERE user_id = sqlc.arg(user_id)
+  AND role <> 'guest'
+LIMIT 1;
+
+-- name: ChannelNameForAccess :one
+SELECT name
+FROM channels
+WHERE id = sqlc.arg(id)
+  AND workspace_id = sqlc.arg(workspace_id);
+
+-- name: RequireChannelAdmin :one
+SELECT 1
+FROM workspace_members
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND user_id = sqlc.arg(user_id)
+  AND role IN ('owner', 'bot');
+
+-- name: InsertBotUser :exec
+INSERT INTO users (id, kind, owner_user_id, display_name, handle, avatar_url, created_at)
+VALUES (sqlc.arg(id), 'bot', sqlc.arg(owner_user_id), sqlc.arg(display_name), sqlc.arg(handle), sqlc.arg(avatar_url), sqlc.arg(created_at));
+
+-- name: InsertBotToken :exec
+INSERT INTO bot_tokens (id, token_hash, bot_user_id, workspace_id, owner_user_id, name, scopes_json, created_by, setup_nonce, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(token_hash), sqlc.arg(bot_user_id), sqlc.arg(workspace_id), sqlc.arg(owner_user_id), sqlc.arg(name), sqlc.arg(scopes_json), sqlc.arg(created_by), sqlc.arg(setup_nonce), sqlc.arg(created_at));
+
+-- name: InsertBotSetupRequest :exec
+INSERT INTO bot_setup_requests (
+  created_by, setup_nonce, bot_user_id, workspace_id, owner_user_id,
+  display_name, handle, avatar_url, created_at
+) VALUES (
+  sqlc.arg(created_by), sqlc.arg(setup_nonce), sqlc.arg(bot_user_id),
+  sqlc.arg(workspace_id), sqlc.arg(owner_user_id), sqlc.arg(display_name),
+  sqlc.arg(handle), sqlc.arg(avatar_url), sqlc.arg(created_at)
+);
+
+-- name: GetBotSetupRequest :one
+SELECT created_by, setup_nonce, bot_user_id, workspace_id, owner_user_id,
+       display_name, handle, avatar_url, created_at
+FROM bot_setup_requests
+WHERE created_by = sqlc.arg(created_by)
+  AND setup_nonce = sqlc.arg(setup_nonce)
+FOR UPDATE;
+
+-- name: ListWorkspaceBots :many
+SELECT u.id, u.kind, COALESCE(u.owner_user_id, '') AS owner_user_id,
+       u.display_name, u.handle, u.avatar_url, u.created_at
+FROM workspace_members wm
+JOIN users u ON u.id = wm.user_id
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND u.kind = 'bot'
+ORDER BY wm.sort_name, wm.sort_handle, wm.user_id;
+
+-- name: ListWorkspaceBotTokenMetadata :many
+SELECT bt.id, bt.bot_user_id, bt.workspace_id,
+       COALESCE(bt.owner_user_id, '') AS owner_user_id,
+       bt.name, bt.scopes_json,
+       COALESCE(bt.created_by, '') AS created_by,
+       bt.created_at,
+       COALESCE(bt.last_used_at, '') AS last_used_at,
+       COALESCE(bt.revoked_at, '') AS revoked_at
+FROM bot_tokens bt
+WHERE bt.workspace_id = sqlc.arg(workspace_id)
+ORDER BY bt.bot_user_id, bt.created_at DESC, bt.id;
+
+-- name: ListBotsOwnedBy :many
+SELECT
+  u.id,
+  u.kind,
+  u.owner_user_id,
+  u.display_name,
+  u.handle,
+  u.avatar_url,
+  u.created_at,
+  w.id AS workspace_id,
+  COALESCE(w.route_id, '') AS workspace_route_id,
+  w.name AS workspace_name,
+  CAST((
+    SELECT COUNT(*)
+    FROM bot_tokens bt
+    WHERE bt.bot_user_id = u.id
+      AND bt.workspace_id = w.id
+      AND bt.revoked_at IS NULL
+  ) AS INTEGER) AS active_token_count
+FROM users u
+JOIN workspace_members wm ON wm.user_id = u.id
+JOIN workspace_members owner_wm ON owner_wm.workspace_id = wm.workspace_id
+  AND owner_wm.user_id = u.owner_user_id
+JOIN workspaces w ON w.id = wm.workspace_id
+WHERE u.kind = 'bot'
+  AND u.owner_user_id = sqlc.arg(owner_user_id)
+ORDER BY lower(w.name), lower(u.display_name), u.id;
+
+-- name: GetBotTokenAuth :one
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+       bt.id AS token_id, bt.workspace_id, bt.scopes_json
+FROM bot_tokens bt
+JOIN users u ON u.id = bt.bot_user_id
+WHERE bt.token_hash = sqlc.arg(token_hash)
+  AND bt.revoked_at IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM bot_tombstones tombstone WHERE tombstone.bot_user_id = u.id
+  );
+
+-- name: GetActiveBotForDeletion :one
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at
+FROM users u
+WHERE u.id = sqlc.arg(bot_user_id)
+  AND u.kind = 'bot'
+  AND NOT EXISTS (
+    SELECT 1 FROM bot_tombstones tombstone WHERE tombstone.bot_user_id = u.id
+  )
+FOR UPDATE;
+
+-- name: ListBotGovernedWorkspaces :many
+SELECT DISTINCT workspace_id
+FROM (
+  SELECT wm.workspace_id
+  FROM workspace_members wm
+  WHERE wm.user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT bt.workspace_id
+  FROM bot_tokens bt
+  WHERE bt.bot_user_id = sqlc.arg(bot_user_id)
+    AND bt.revoked_at IS NULL
+  UNION
+  SELECT bc.workspace_id
+  FROM bot_commands bc
+  WHERE bc.bot_user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT ai.workspace_id
+  FROM app_installations ai
+  WHERE ai.bot_user_id = sqlc.arg(bot_user_id)
+    AND ai.revoked_at IS NULL
+  UNION
+  SELECT sc.workspace_id
+  FROM slash_commands sc
+  WHERE sc.bot_user_id = sqlc.arg(bot_user_id)
+    AND sc.revoked_at IS NULL
+  UNION
+  SELECT es.workspace_id
+  FROM event_subscriptions es
+  JOIN app_installations ai ON ai.id = es.app_installation_id
+  WHERE ai.bot_user_id = sqlc.arg(bot_user_id)
+    AND es.revoked_at IS NULL
+  UNION
+  SELECT ca.workspace_id
+  FROM connected_accounts ca
+  WHERE ca.user_id = sqlc.arg(bot_user_id)
+    AND ca.revoked_at IS NULL
+) AS governed
+ORDER BY workspace_id;
+
+-- name: ListBotHistoricalWorkspaces :many
+SELECT DISTINCT workspace_id
+FROM (
+  SELECT bt.workspace_id
+  FROM bot_tokens bt
+  WHERE bt.bot_user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT ai.workspace_id
+  FROM app_installations ai
+  WHERE ai.bot_user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT sc.workspace_id
+  FROM slash_commands sc
+  WHERE sc.bot_user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT es.workspace_id
+  FROM event_subscriptions es
+  JOIN app_installations ai ON ai.id = es.app_installation_id
+  WHERE ai.bot_user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT ca.workspace_id
+  FROM connected_accounts ca
+  WHERE ca.user_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT m.workspace_id
+  FROM messages m
+  WHERE m.author_id = sqlc.arg(bot_user_id)
+  UNION
+  SELECT dc.workspace_id
+  FROM direct_conversations dc
+  JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+  WHERE dcm.user_id = sqlc.arg(bot_user_id)
+) AS historical
+ORDER BY workspace_id;
+
+-- name: InsertBotTombstone :exec
+INSERT INTO bot_tombstones (bot_user_id, former_handle, deleted_at, deleted_by)
+VALUES (sqlc.arg(bot_user_id), sqlc.arg(former_handle), sqlc.arg(deleted_at), sqlc.arg(deleted_by));
+
+-- name: RetireBotUser :execrows
+UPDATE users
+SET handle = ''
+WHERE id = sqlc.arg(bot_user_id)
+  AND kind = 'bot';
+
+-- name: RevokeAllBotTokens :execrows
+UPDATE bot_tokens
+SET revoked_at = COALESCE(revoked_at, sqlc.arg(revoked_at))
+WHERE bot_user_id = sqlc.arg(bot_user_id)
+  AND revoked_at IS NULL;
+
+-- name: RevokeAllBotSlashCommands :execrows
+UPDATE slash_commands
+SET revoked_at = COALESCE(revoked_at, sqlc.arg(revoked_at))
+WHERE bot_user_id = sqlc.arg(bot_user_id)
+  AND revoked_at IS NULL;
+
+-- name: RevokeAllBotEventSubscriptions :execrows
+UPDATE event_subscriptions
+SET revoked_at = COALESCE(revoked_at, sqlc.arg(revoked_at))
+WHERE revoked_at IS NULL
+  AND app_installation_id IN (
+    SELECT id FROM app_installations WHERE bot_user_id = sqlc.arg(bot_user_id)
+  );
+
+-- name: RevokeAllBotConnectedAccounts :execrows
+UPDATE connected_accounts
+SET revoked_at = COALESCE(revoked_at, sqlc.arg(revoked_at))
+WHERE user_id = sqlc.arg(bot_user_id)
+  AND revoked_at IS NULL;
+
+-- name: RevokeAllBotAppInstallations :execrows
+UPDATE app_installations
+SET revoked_at = COALESCE(revoked_at, sqlc.arg(revoked_at))
+WHERE bot_user_id = sqlc.arg(bot_user_id)
+  AND revoked_at IS NULL;
+
+-- name: DeleteAllBotCommands :exec
+DELETE FROM bot_commands
+WHERE bot_user_id = sqlc.arg(bot_user_id);
+
+-- name: DeleteAllBotWorkspaceMemberships :execrows
+DELETE FROM workspace_members
+WHERE user_id = sqlc.arg(bot_user_id);
+
+-- name: TouchBotToken :exec
+UPDATE bot_tokens
+SET last_used_at = sqlc.arg(last_used_at)
+WHERE id = sqlc.arg(id);
+
+-- name: CountRecentGuestWritesByAuthor :one
+SELECT COUNT(*)
+FROM (
+  SELECT 1 AS guest_write
+  FROM messages m
+  WHERE m.workspace_id = sqlc.arg(workspace_id)
+    AND m.author_id = sqlc.arg(author_id)
+    AND m.direct_conversation_id IS NULL
+    AND m.channel_id IN (SELECT c.id FROM channels c WHERE c.workspace_id = sqlc.arg(workspace_id) AND c.name = 'guest')
+    AND m.created_at >= sqlc.arg(cutoff)
+  UNION ALL
+  SELECT 1 AS guest_write
+  FROM slash_command_invocations sci
+  WHERE sci.workspace_id = sqlc.arg(workspace_id)
+    AND sci.user_id = sqlc.arg(author_id)
+    AND sci.channel_id IN (SELECT c.id FROM channels c WHERE c.workspace_id = sqlc.arg(workspace_id) AND c.name = 'guest')
+    AND sci.created_at >= sqlc.arg(cutoff)
+  LIMIT sqlc.arg(write_limit)
+) AS guest_writes;
+
+-- name: ListWorkspaceMembersForModeration :many
+SELECT u.id, u.kind, COALESCE(u.owner_user_id, '') AS owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+       wm.role, COALESCE(m.timeout_until, '') AS timeout_until, COALESCE(m.blocked_at, '') AS blocked_at,
+       COALESCE(m.moderation_note, '') AS moderation_note, COALESCE(m.moderation_by, '') AS moderation_by,
+       COALESCE(m.moderation_at, '') AS moderation_at
+FROM workspace_members wm
+JOIN users u ON u.id = wm.user_id
+LEFT JOIN workspace_member_moderation m ON m.workspace_id = wm.workspace_id AND m.user_id = wm.user_id
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+ORDER BY CASE wm.role WHEN 'owner' THEN 4 WHEN 'moderator' THEN 3 WHEN 'member' THEN 2 ELSE 1 END DESC,
+         lower(u.display_name);
+
+-- name: ListWorkspaceMemberPage :many
+SELECT u.id, u.kind, COALESCE(u.owner_user_id, '') AS owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+       wm.role, wm.created_at AS joined_at,
+       CAST(wm.role_sort AS INTEGER) AS role_sort,
+       wm.sort_name,
+       wm.sort_handle
+FROM workspace_members wm
+JOIN users u ON u.id = wm.user_id
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND (CAST(sqlc.arg(role_filter) AS TEXT) = '' OR wm.role = CAST(sqlc.arg(role_filter) AS TEXT))
+  AND (CAST(sqlc.arg(search_query) AS TEXT) = '' OR position(CAST(sqlc.arg(search_query) AS TEXT) in wm.sort_name) > 0 OR position(CAST(sqlc.arg(search_query) AS TEXT) in wm.sort_handle) > 0)
+  AND (wm.role_sort, wm.sort_name, wm.sort_handle, wm.user_id) > (
+    CAST(sqlc.arg(cursor_role_sort) AS SMALLINT),
+    CAST(sqlc.arg(cursor_sort_name) AS TEXT),
+    CAST(sqlc.arg(cursor_sort_handle) AS TEXT),
+    CAST(sqlc.arg(cursor_user_id) AS TEXT)
+  )
+ORDER BY wm.role_sort, wm.sort_name, wm.sort_handle, wm.user_id
+LIMIT sqlc.arg(limit_count);
+
+-- name: CountWorkspaceMemberRoles :one
+SELECT
+  COUNT(*) AS total_count,
+  COUNT(*) FILTER (WHERE role = 'owner') AS owner_count,
+  COUNT(*) FILTER (WHERE role = 'moderator') AS moderator_count,
+  COUNT(*) FILTER (WHERE role = 'member') AS member_count,
+  COUNT(*) FILTER (WHERE role = 'bot') AS bot_count,
+  COUNT(*) FILTER (WHERE role = 'guest') AS guest_count
+FROM workspace_members
+WHERE workspace_id = sqlc.arg(workspace_id);
+
+-- name: CountWorkspaceMembers :one
+SELECT COUNT(*)
+FROM workspace_members
+WHERE workspace_id = sqlc.arg(workspace_id);
+
+-- name: CountWorkspaceMembersByRole :one
+SELECT COUNT(*)
+FROM workspace_members
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND role = sqlc.arg(role_filter);
+
+-- name: CountWorkspaceMemberSearch :one
+SELECT COUNT(*)
+FROM workspace_members wm
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND (position(CAST(sqlc.arg(search_query) AS TEXT) in wm.sort_name) > 0 OR position(CAST(sqlc.arg(search_query) AS TEXT) in wm.sort_handle) > 0);
+
+-- name: CountWorkspaceMemberSearchByRole :one
+SELECT COUNT(*)
+FROM workspace_members wm
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.role = sqlc.arg(role_filter)
+  AND (position(CAST(sqlc.arg(search_query) AS TEXT) in wm.sort_name) > 0 OR position(CAST(sqlc.arg(search_query) AS TEXT) in wm.sort_handle) > 0);
+
+-- name: UpdateWorkspaceMemberRole :exec
+UPDATE workspace_members
+SET role = sqlc.arg(role),
+    role_sort = CASE sqlc.arg(role) WHEN 'owner' THEN 0 WHEN 'moderator' THEN 1 WHEN 'member' THEN 2 WHEN 'bot' THEN 3 WHEN 'guest' THEN 4 ELSE 9 END
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: GetMemberModerationState :one
+SELECT timeout_until, blocked_at
+FROM workspace_member_moderation
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: UpsertMemberModeration :exec
+INSERT INTO workspace_member_moderation (workspace_id, user_id, timeout_until, blocked_at, moderation_note, moderation_by, moderation_at)
+VALUES (sqlc.arg(workspace_id), sqlc.arg(user_id), sqlc.arg(timeout_until), sqlc.arg(blocked_at), '', sqlc.arg(moderation_by), sqlc.arg(moderation_at))
+ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+  timeout_until = CASE WHEN excluded.timeout_until <> '' THEN excluded.timeout_until ELSE workspace_member_moderation.timeout_until END,
+  blocked_at = CASE WHEN excluded.blocked_at <> '' THEN excluded.blocked_at ELSE workspace_member_moderation.blocked_at END,
+  moderation_by = excluded.moderation_by,
+  moderation_at = excluded.moderation_at;
+
+-- name: UpsertMemberModerationWithNote :exec
+INSERT INTO workspace_member_moderation (workspace_id, user_id, timeout_until, blocked_at, moderation_note, moderation_by, moderation_at)
+VALUES (sqlc.arg(workspace_id), sqlc.arg(user_id), sqlc.arg(timeout_until), sqlc.arg(blocked_at), sqlc.arg(moderation_note), sqlc.arg(moderation_by), sqlc.arg(moderation_at))
+ON CONFLICT(workspace_id, user_id) DO UPDATE SET
+  timeout_until = CASE WHEN excluded.timeout_until <> '' THEN excluded.timeout_until ELSE workspace_member_moderation.timeout_until END,
+  blocked_at = CASE WHEN excluded.blocked_at <> '' THEN excluded.blocked_at ELSE workspace_member_moderation.blocked_at END,
+  moderation_note = excluded.moderation_note,
+  moderation_by = excluded.moderation_by,
+  moderation_at = excluded.moderation_at;
+
+-- name: ClearMemberTimeout :exec
+UPDATE workspace_member_moderation
+SET timeout_until = NULL,
+    moderation_by = sqlc.arg(moderation_by),
+    moderation_at = sqlc.arg(moderation_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: ClearMemberBlocked :exec
+UPDATE workspace_member_moderation
+SET blocked_at = NULL,
+    moderation_by = sqlc.arg(moderation_by),
+    moderation_at = sqlc.arg(moderation_at)
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: InsertUpload :exec
+INSERT INTO uploads (id, workspace_id, owner_id, client_nonce, filename, content_type, byte_size, width, height, duration_ms, storage_path, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(owner_id), sqlc.arg(client_nonce), sqlc.arg(filename), sqlc.arg(content_type), sqlc.arg(byte_size), sqlc.arg(width), sqlc.arg(height), sqlc.arg(duration_ms), sqlc.arg(storage_path), sqlc.arg(created_at));
+
+-- name: GetUpload :one
+SELECT id, workspace_id, owner_id, client_nonce, filename, content_type, byte_size, width, height, duration_ms, storage_path, created_at
+FROM uploads
+WHERE id = sqlc.arg(id);
+
+-- name: GetMessageIDByAuthorNonce :one
+SELECT id
+FROM messages
+WHERE author_id = sqlc.arg(author_id) AND client_nonce = sqlc.arg(client_nonce);
+
+-- name: GetUploadByOwnerNonce :one
+SELECT id, workspace_id, owner_id, client_nonce, filename, content_type, byte_size, width, height, duration_ms, storage_path, created_at
+FROM uploads
+WHERE owner_id = sqlc.arg(owner_id) AND client_nonce = sqlc.arg(client_nonce);
+
+-- name: GetUploadWorkspace :one
+SELECT workspace_id
+FROM uploads
+WHERE id = sqlc.arg(id);
+
+-- name: UploadHasDirectMessageAttachment :one
+SELECT EXISTS (
+  SELECT 1
+  FROM message_attachments ma
+  JOIN messages m ON m.id = ma.message_id
+  WHERE ma.upload_id = sqlc.arg(upload_id)
+    AND m.deleted_at IS NULL
+    AND m.direct_conversation_id IS NOT NULL
+    AND m.direct_conversation_id <> ''
+) AS has_direct_message_attachment;
+
+-- name: UploadHasOtherDirectMessageAttachment :one
+SELECT EXISTS (
+  SELECT 1
+  FROM message_attachments ma
+  JOIN messages m ON m.id = ma.message_id
+  WHERE ma.upload_id = sqlc.arg(upload_id)
+    AND ma.message_id <> sqlc.arg(message_id)
+    AND m.deleted_at IS NULL
+    AND m.direct_conversation_id IS NOT NULL
+    AND m.direct_conversation_id <> ''
+) AS has_other_direct_message_attachment;
+
+-- name: InsertUploadQuotaReservation :exec
+INSERT INTO upload_quota_reservations (id, workspace_id, owner_id, client_nonce, byte_size, created_at, expires_at)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(owner_id), sqlc.arg(client_nonce), sqlc.arg(byte_size), sqlc.arg(created_at), sqlc.arg(expires_at));
+
+-- name: GetUploadQuotaReservation :one
+SELECT id, workspace_id, owner_id, client_nonce, byte_size, created_at, expires_at
+FROM upload_quota_reservations
+WHERE id = sqlc.arg(id);
+
+-- name: GetUploadQuotaReservationByOwnerNonce :one
+SELECT id, workspace_id, owner_id, client_nonce, byte_size, created_at, expires_at
+FROM upload_quota_reservations
+WHERE owner_id = sqlc.arg(owner_id) AND client_nonce = sqlc.arg(client_nonce);
+
+-- name: DeleteUploadQuotaReservation :execrows
+DELETE FROM upload_quota_reservations
+WHERE id = sqlc.arg(id) AND owner_id = sqlc.arg(owner_id);
+
+-- name: DeleteExpiredUploadQuotaReservations :exec
+DELETE FROM upload_quota_reservations
+WHERE expires_at <= sqlc.arg(now);
+
+-- name: AttachUpload :execrows
+INSERT INTO message_attachments (message_id, upload_id, created_at)
+VALUES (sqlc.arg(message_id), sqlc.arg(upload_id), sqlc.arg(created_at))
+ON CONFLICT DO NOTHING;
+
+-- name: GetChannelWorkspace :one
+SELECT workspace_id
+FROM channels
+WHERE id = sqlc.arg(id);
+
+-- name: GetActiveSlashCommandWorkspace :one
+SELECT workspace_id
+FROM slash_commands
+WHERE id = sqlc.arg(id) AND revoked_at IS NULL
+FOR SHARE;
+
+-- name: GetDirectConversationWorkspace :one
+SELECT workspace_id
+FROM direct_conversations
+WHERE id = sqlc.arg(id);
+
+-- name: ChannelLastSeq :one
+SELECT CAST(COALESCE(MAX(channel_seq), 0) AS BIGINT) AS last_seq
+FROM messages
+WHERE channel_id = sqlc.arg(channel_id)::text
+  AND parent_message_id IS NULL;
+
+-- name: ChannelNextSeq :one
+SELECT CAST(COALESCE(MAX(channel_seq), 0) + 1 AS BIGINT) AS next_seq
+FROM messages
+WHERE channel_id = sqlc.arg(channel_id)::text
+  AND parent_message_id IS NULL;
+
+-- name: DirectLastSeq :one
+SELECT CAST(COALESCE(MAX(channel_seq), 0) AS BIGINT) AS last_seq
+FROM messages
+WHERE direct_conversation_id = sqlc.arg(conversation_id)::text
+  AND parent_message_id IS NULL;
+
+-- name: DirectNextSeq :one
+SELECT CAST(COALESCE(MAX(channel_seq), 0) + 1 AS BIGINT) AS next_seq
+FROM messages
+WHERE direct_conversation_id = sqlc.arg(conversation_id)::text;
+
+-- name: ReadChannelRead :one
+SELECT last_read_seq, last_read_at
+FROM channel_reads
+WHERE channel_id = sqlc.arg(channel_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: ReadDirectRead :one
+SELECT last_read_seq, last_read_at
+FROM direct_reads
+WHERE conversation_id = sqlc.arg(conversation_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: UpsertChannelRead :execrows
+INSERT INTO channel_reads (channel_id, user_id, last_read_seq, last_read_at)
+VALUES (sqlc.arg(channel_id), sqlc.arg(user_id), sqlc.arg(last_read_seq), sqlc.arg(last_read_at))
+ON CONFLICT(channel_id, user_id) DO UPDATE SET
+  last_read_seq = excluded.last_read_seq,
+  last_read_at = excluded.last_read_at
+WHERE excluded.last_read_seq > channel_reads.last_read_seq;
+
+-- name: UpsertDirectRead :execrows
+INSERT INTO direct_reads (conversation_id, user_id, last_read_seq, last_read_at)
+VALUES (sqlc.arg(conversation_id), sqlc.arg(user_id), sqlc.arg(last_read_seq), sqlc.arg(last_read_at))
+ON CONFLICT(conversation_id, user_id) DO UPDATE SET
+  last_read_seq = excluded.last_read_seq,
+  last_read_at = excluded.last_read_at
+WHERE excluded.last_read_seq > direct_reads.last_read_seq;
+
+-- name: ListDirectConversations :many
+SELECT dc.id, COALESCE(dc.route_id, '') AS route_id, dc.workspace_id, dc.created_at,
+       CAST(COALESCE((SELECT MAX(channel_seq) FROM messages WHERE direct_conversation_id = dc.id AND parent_message_id IS NULL), 0) AS BIGINT) AS last_seq,
+       CAST(COALESCE((SELECT dr.last_read_seq FROM direct_reads dr WHERE dr.conversation_id = dc.id AND dr.user_id = sqlc.arg(reader_user_id)), 0) AS BIGINT) AS last_read_seq,
+       CAST(COALESCE((
+         SELECT COUNT(*)
+         FROM messages m
+         WHERE m.direct_conversation_id = dc.id
+           AND m.parent_message_id IS NULL
+           AND m.author_id <> sqlc.arg(reader_user_id)
+           AND m.kind = 'message'
+           AND m.channel_seq > COALESCE((SELECT dr2.last_read_seq FROM direct_reads dr2 WHERE dr2.conversation_id = dc.id AND dr2.user_id = sqlc.arg(reader_user_id)), 0)
+       ), 0) AS BIGINT) AS unread_count,
+       EXISTS (
+         SELECT 1
+         FROM direct_conversation_members peer
+         JOIN workspace_members peer_wm
+           ON peer_wm.workspace_id = dc.workspace_id
+          AND peer_wm.user_id = peer.user_id
+         LEFT JOIN bot_tombstones tombstone ON tombstone.bot_user_id = peer.user_id
+         WHERE peer.conversation_id = dc.id
+           AND peer.user_id <> sqlc.arg(reader_user_id)
+           AND tombstone.bot_user_id IS NULL
+       ) AS can_send
+FROM direct_conversations dc
+JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+WHERE dc.workspace_id = sqlc.arg(workspace_id)
+  AND dcm.user_id = sqlc.arg(reader_user_id)
+  AND NOT EXISTS (
+    SELECT 1
+    FROM direct_conversation_hidden dch
+    WHERE dch.conversation_id = dc.id
+      AND dch.user_id = sqlc.arg(reader_user_id)
+  )
+ORDER BY dc.created_at;
+
+-- name: GetDirectConversation :one
+SELECT dc.id, COALESCE(dc.route_id, '') AS route_id, dc.workspace_id, dc.created_at,
+       CAST(COALESCE((SELECT MAX(channel_seq) FROM messages WHERE direct_conversation_id = dc.id AND parent_message_id IS NULL), 0) AS BIGINT) AS last_seq,
+       CAST(COALESCE((SELECT dr.last_read_seq FROM direct_reads dr WHERE dr.conversation_id = dc.id AND dr.user_id = sqlc.arg(reader_user_id)), 0) AS BIGINT) AS last_read_seq,
+       CAST(COALESCE((
+         SELECT COUNT(*)
+         FROM messages m
+         WHERE m.direct_conversation_id = dc.id
+           AND m.parent_message_id IS NULL
+           AND m.author_id <> sqlc.arg(reader_user_id)
+           AND m.kind = 'message'
+           AND m.channel_seq > COALESCE((SELECT dr2.last_read_seq FROM direct_reads dr2 WHERE dr2.conversation_id = dc.id AND dr2.user_id = sqlc.arg(reader_user_id)), 0)
+       ), 0) AS BIGINT) AS unread_count,
+       EXISTS (
+         SELECT 1
+         FROM direct_conversation_members peer
+         JOIN workspace_members peer_wm
+           ON peer_wm.workspace_id = dc.workspace_id
+          AND peer_wm.user_id = peer.user_id
+         LEFT JOIN bot_tombstones tombstone ON tombstone.bot_user_id = peer.user_id
+         WHERE peer.conversation_id = dc.id
+           AND peer.user_id <> sqlc.arg(reader_user_id)
+           AND tombstone.bot_user_id IS NULL
+       ) AS can_send
+FROM direct_conversations dc
+JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+WHERE dc.id = sqlc.arg(conversation_id)
+  AND dcm.user_id = sqlc.arg(reader_user_id);
+
+-- name: FindOneToOneDirectConversation :one
+SELECT dc.id, COALESCE(dc.route_id, '') AS route_id, dc.workspace_id, dc.created_at
+FROM direct_conversations dc
+WHERE dc.workspace_id = sqlc.arg(workspace_id)
+  AND EXISTS (
+    SELECT 1 FROM direct_conversation_members first_member
+    WHERE first_member.conversation_id = dc.id
+      AND first_member.user_id = sqlc.arg(first_user_id)
+  )
+  AND EXISTS (
+    SELECT 1 FROM direct_conversation_members second_member
+    WHERE second_member.conversation_id = dc.id
+      AND second_member.user_id = sqlc.arg(second_user_id)
+  )
+  AND (
+    SELECT COUNT(*) FROM direct_conversation_members member_count
+    WHERE member_count.conversation_id = dc.id
+  ) = 2
+ORDER BY dc.created_at, dc.id
+LIMIT 1;
+
+-- name: GetDirectConversationByMemberSetKey :one
+SELECT id, COALESCE(route_id, '') AS route_id, workspace_id, created_at
+FROM direct_conversations
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND member_set_key = sqlc.arg(member_set_key);
+
+-- name: InsertDirectConversation :execrows
+INSERT INTO direct_conversations (id, route_id, workspace_id, created_at, member_set_key)
+VALUES (sqlc.arg(id), sqlc.arg(route_id), sqlc.arg(workspace_id), sqlc.arg(created_at), sqlc.arg(member_set_key))
+ON CONFLICT DO NOTHING;
+
+-- name: InsertDirectConversationMember :exec
+INSERT INTO direct_conversation_members (conversation_id, user_id, created_at)
+VALUES (sqlc.arg(conversation_id), sqlc.arg(user_id), sqlc.arg(created_at));
+
+-- name: HideDirectConversation :exec
+INSERT INTO direct_conversation_hidden (conversation_id, user_id, hidden_at)
+VALUES (sqlc.arg(conversation_id), sqlc.arg(user_id), sqlc.arg(hidden_at))
+ON CONFLICT(conversation_id, user_id) DO UPDATE SET
+  hidden_at = excluded.hidden_at;
+
+-- name: UnhideDirectConversation :exec
+DELETE FROM direct_conversation_hidden
+WHERE conversation_id = sqlc.arg(conversation_id)
+  AND user_id = sqlc.arg(user_id);
+
+-- name: UnhideDirectConversationForMembers :exec
+DELETE FROM direct_conversation_hidden
+WHERE conversation_id = sqlc.arg(conversation_id);
+
+-- name: RequireDirectMembership :one
+SELECT 1
+FROM direct_conversation_members dcm
+JOIN direct_conversations dc ON dc.id = dcm.conversation_id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+WHERE dcm.conversation_id = sqlc.arg(conversation_id)
+  AND dcm.user_id = sqlc.arg(user_id)
+FOR KEY SHARE OF wm;
+
+-- name: DirectConversationMemberIDs :many
+SELECT dcm.user_id
+FROM direct_conversation_members dcm
+JOIN direct_conversations dc ON dc.id = dcm.conversation_id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+WHERE dcm.conversation_id = sqlc.arg(conversation_id)
+ORDER BY dcm.user_id;
+
+-- name: DirectConversationMembers :many
+SELECT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+       COALESCE(tombstone.former_handle, '') AS former_handle,
+       COALESCE(tombstone.deleted_at, '') AS deleted_at
+FROM users u
+JOIN direct_conversation_members dcm ON dcm.user_id = u.id
+LEFT JOIN bot_tombstones tombstone ON tombstone.bot_user_id = u.id
+WHERE dcm.conversation_id = sqlc.arg(conversation_id)
+ORDER BY u.display_name;
+
+-- name: InsertChannelMessage :exec
+INSERT INTO messages (id, workspace_id, channel_id, direct_conversation_id, author_id, parent_message_id, thread_root_id, topic_id, channel_seq, thread_seq, body, body_format, created_at, quoted_message_id, quoted_body_snapshot, quoted_author_id, client_nonce, kind, turn_id)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(channel_id), NULL, sqlc.arg(author_id), NULL, sqlc.arg(thread_root_id), sqlc.arg(topic_id), sqlc.arg(channel_seq), NULL, sqlc.arg(body), 'markdown', sqlc.arg(created_at), sqlc.arg(quoted_message_id), sqlc.arg(quoted_body_snapshot), sqlc.arg(quoted_author_id), sqlc.arg(client_nonce), sqlc.arg(kind), sqlc.arg(turn_id));
+
+-- name: InsertDirectMessage :exec
+INSERT INTO messages (id, workspace_id, channel_id, direct_conversation_id, author_id, parent_message_id, thread_root_id, channel_seq, thread_seq, body, body_format, created_at, quoted_message_id, quoted_body_snapshot, quoted_author_id, client_nonce, kind, turn_id)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), NULL, sqlc.arg(direct_conversation_id), sqlc.arg(author_id), NULL, sqlc.arg(thread_root_id), sqlc.arg(channel_seq), NULL, sqlc.arg(body), 'markdown', sqlc.arg(created_at), sqlc.arg(quoted_message_id), sqlc.arg(quoted_body_snapshot), sqlc.arg(quoted_author_id), sqlc.arg(client_nonce), sqlc.arg(kind), sqlc.arg(turn_id));
+
+-- name: InsertThreadState :exec
+INSERT INTO thread_state (root_message_id)
+VALUES (sqlc.arg(root_message_id));
+
+-- name: GetThreadState :one
+SELECT root_message_id, reply_count, last_reply_at, last_reply_author_ids_json
+FROM thread_state
+WHERE root_message_id = sqlc.arg(root_message_id);
+
+-- name: ListThreadStates :many
+SELECT root_message_id, reply_count, last_reply_at, last_reply_author_ids_json
+FROM thread_state
+WHERE root_message_id = ANY(sqlc.arg(root_message_ids)::text[]);
+
+-- name: ThreadNextSeq :one
+SELECT CAST(COALESCE(MAX(thread_seq), 0) + 1 AS BIGINT) AS next_seq
+FROM messages
+WHERE thread_root_id = sqlc.arg(thread_root_id)
+  AND parent_message_id = sqlc.arg(parent_message_id);
+
+-- name: UpdateThreadState :exec
+UPDATE thread_state
+SET reply_count = reply_count + 1,
+    last_reply_at = sqlc.arg(last_reply_at),
+    last_reply_author_ids_json = sqlc.arg(last_reply_author_ids_json)
+WHERE root_message_id = sqlc.arg(root_message_id);
+
+-- name: InsertThreadReply :exec
+INSERT INTO messages (id, workspace_id, channel_id, direct_conversation_id, author_id, parent_message_id, thread_root_id, channel_seq, thread_seq, body, body_format, created_at, quoted_message_id, quoted_body_snapshot, quoted_author_id, client_nonce)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(channel_id), sqlc.arg(direct_conversation_id), sqlc.arg(author_id), sqlc.arg(parent_message_id), sqlc.arg(thread_root_id), NULL, sqlc.arg(thread_seq), sqlc.arg(body), 'markdown', sqlc.arg(created_at), sqlc.arg(quoted_message_id), sqlc.arg(quoted_body_snapshot), sqlc.arg(quoted_author_id), sqlc.arg(client_nonce));
+
+-- name: GetChannel :one
+SELECT id, COALESCE(route_id, '') AS route_id, workspace_id, name, display_title, kind, created_at, archived_at,
+       external_managed, external_ref, external_url, sidebar_section
+FROM channels
+WHERE id = sqlc.arg(id);
+
+-- name: GetChannelByIDAndWorkspace :one
+SELECT id, COALESCE(route_id, '') AS route_id, workspace_id, name, display_title, kind, created_at, archived_at,
+       external_managed, external_ref, external_url, sidebar_section
+FROM channels
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(id);
+
+-- name: GetChannelByRouteIDAndWorkspace :one
+SELECT id, COALESCE(route_id, '') AS route_id, workspace_id, name, display_title, kind, created_at, archived_at,
+       external_managed, external_ref, external_url, sidebar_section
+FROM channels
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND route_id = sqlc.arg(route_id);
+
+-- name: GetDirectByIDAndWorkspace :one
+SELECT dc.id, COALESCE(dc.route_id, '') AS route_id, dc.workspace_id, dc.created_at
+FROM direct_conversations dc
+JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+WHERE dc.workspace_id = sqlc.arg(workspace_id)
+  AND dc.id = sqlc.arg(id)
+  AND dcm.user_id = sqlc.arg(user_id);
+
+-- name: GetDirectByRouteIDAndWorkspace :one
+SELECT dc.id, COALESCE(dc.route_id, '') AS route_id, dc.workspace_id, dc.created_at
+FROM direct_conversations dc
+JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+WHERE dc.workspace_id = sqlc.arg(workspace_id)
+  AND dc.route_id = sqlc.arg(route_id)
+  AND dcm.user_id = sqlc.arg(user_id);
+
+-- name: ChannelRouteID :one
+SELECT COALESCE(route_id, '') AS route_id
+FROM channels
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND id = sqlc.arg(id);
+
+-- name: DirectRouteID :one
+SELECT COALESCE(dc.route_id, '') AS route_id
+FROM direct_conversations dc
+JOIN direct_conversation_members dcm ON dcm.conversation_id = dc.id
+JOIN workspace_members wm ON wm.workspace_id = dc.workspace_id AND wm.user_id = dcm.user_id
+WHERE dc.workspace_id = sqlc.arg(workspace_id)
+  AND dc.id = sqlc.arg(id)
+  AND dcm.user_id = sqlc.arg(user_id);
+
+-- name: UpdateChannel :exec
+UPDATE channels
+SET name = sqlc.arg(name),
+    display_title = sqlc.arg(display_title),
+    kind = sqlc.arg(kind),
+    archived_at = sqlc.arg(archived_at),
+    external_managed = sqlc.arg(external_managed),
+    external_ref = sqlc.arg(external_ref),
+    external_url = sqlc.arg(external_url),
+    sidebar_section = sqlc.arg(sidebar_section)
+WHERE id = sqlc.arg(id);
+
+-- name: UpdateMessageBody :execrows
+UPDATE messages
+SET body = sqlc.arg(body),
+    edited_at = sqlc.arg(edited_at)
+WHERE id = sqlc.arg(id)
+  AND deleted_at IS NULL;
+
+-- name: DeleteMessageBody :execrows
+UPDATE messages
+SET body = '',
+    deleted_at = sqlc.arg(deleted_at)
+WHERE id = sqlc.arg(id)
+  AND deleted_at IS NULL;
+
+-- name: AddReaction :execrows
+INSERT INTO reactions (message_id, user_id, emoji, created_at)
+VALUES (sqlc.arg(message_id), sqlc.arg(user_id), sqlc.arg(emoji), sqlc.arg(created_at))
+ON CONFLICT DO NOTHING;
+
+-- name: RemoveReaction :execrows
+DELETE FROM reactions
+WHERE message_id = sqlc.arg(message_id)
+  AND user_id = sqlc.arg(user_id)
+  AND emoji = sqlc.arg(emoji);
+
+-- name: CountMessageReaction :one
+SELECT COUNT(*)
+FROM reactions
+WHERE message_id = sqlc.arg(message_id)
+  AND emoji = sqlc.arg(emoji);
+
+-- name: LockMessageForReaction :one
+SELECT id
+FROM messages
+WHERE id = sqlc.arg(message_id)
+FOR UPDATE;
+
+-- name: ListReactionsForMessages :many
+SELECT
+  r.message_id,
+  r.emoji,
+  COUNT(*)::bigint AS reaction_count,
+  BOOL_OR(r.user_id = sqlc.arg(user_id)) AS reacted_by_me
+FROM reactions r
+WHERE r.message_id = ANY(sqlc.arg(message_ids)::text[])
+GROUP BY r.message_id, r.emoji
+ORDER BY r.message_id, reaction_count DESC, r.emoji;
+
+-- name: EventCursorExists :one
+SELECT EXISTS (
+  SELECT 1 FROM events WHERE workspace_id = sqlc.arg(workspace_id) AND cursor = sqlc.arg(cursor)
+);
+
+-- name: PinMessage :execrows
+INSERT INTO pinned_messages (id, workspace_id, channel_id, message_id, pinned_by, created_at)
+VALUES (sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(channel_id), sqlc.arg(message_id), sqlc.arg(pinned_by), sqlc.arg(created_at))
+ON CONFLICT(channel_id, message_id) DO NOTHING;
+
+-- name: LockChannelForUpdate :one
+SELECT id FROM channels WHERE id = sqlc.arg(channel_id) FOR UPDATE;
+
+-- name: LockMessageForPinning :one
+SELECT id FROM messages WHERE id = sqlc.arg(message_id) FOR UPDATE;
+
+-- name: CountPinnedMessages :one
+SELECT COUNT(*)
+FROM pinned_messages p
+JOIN messages m ON m.id = p.message_id
+WHERE p.channel_id = sqlc.arg(channel_id)
+  AND m.deleted_at IS NULL;
+
+-- name: CountPinnedMessage :one
+SELECT COUNT(*) FROM pinned_messages
+WHERE channel_id = sqlc.arg(channel_id)
+  AND message_id = sqlc.arg(message_id);
+
+-- name: UnpinMessage :execrows
+DELETE FROM pinned_messages
+WHERE channel_id = sqlc.arg(channel_id)
+  AND message_id = sqlc.arg(message_id);
+
+-- name: ListPinnedMessages :many
+SELECT m.id, COALESCE(m.route_id, '') AS route_id, m.workspace_id,
+       COALESCE(m.channel_id, '') AS channel_id,
+       COALESCE(m.direct_conversation_id, '') AS direct_conversation_id,
+       m.author_id, m.parent_message_id, m.thread_root_id,
+       COALESCE(m.topic_id, '') AS topic_id, m.channel_seq, m.thread_seq,
+       m.body, m.body_format, m.created_at, m.edited_at, m.deleted_at,
+       u.id AS user_id, u.kind AS user_kind, u.owner_user_id,
+       u.display_name, u.handle, u.avatar_url, u.created_at AS user_created_at,
+       author_tombstone.former_handle AS author_former_handle,
+       author_tombstone.deleted_at AS author_deleted_at,
+       m.quoted_message_id, m.quoted_body_snapshot, m.quoted_author_id,
+       qu.id AS quoted_user_id, qu.kind AS quoted_user_kind,
+       qu.owner_user_id AS quoted_owner_user_id,
+       qu.display_name AS quoted_display_name, qu.handle AS quoted_handle,
+       qu.avatar_url AS quoted_avatar_url, qu.created_at AS quoted_user_created_at,
+       quoted_tombstone.former_handle AS quoted_former_handle,
+       quoted_tombstone.deleted_at AS quoted_deleted_at,
+       m.client_nonce, m.kind AS message_kind, COALESCE(m.turn_id, '') AS turn_id
+FROM pinned_messages p
+JOIN messages m ON m.id = p.message_id
+JOIN users u ON u.id = m.author_id
+LEFT JOIN bot_tombstones author_tombstone ON author_tombstone.bot_user_id = u.id
+LEFT JOIN users qu ON qu.id = m.quoted_author_id
+LEFT JOIN bot_tombstones quoted_tombstone ON quoted_tombstone.bot_user_id = qu.id
+WHERE p.workspace_id = sqlc.arg(workspace_id)
+  AND p.channel_id = sqlc.arg(channel_id)
+  AND m.deleted_at IS NULL
+ORDER BY p.created_at DESC
+LIMIT sqlc.arg(limit_count);
+
+-- name: ListEventsAfter :many
+SELECT e.id, e.cursor, e.workspace_id, COALESCE(e.channel_id, '') AS channel_id, e.type, e.seq, e.payload_json, e.created_at, e.mentioned_user_ids::text AS mentioned_user_ids
+FROM events e
+JOIN workspace_members viewer ON viewer.workspace_id = e.workspace_id AND viewer.user_id = sqlc.arg(user_id)
+LEFT JOIN channels event_channel ON event_channel.id = e.channel_id AND event_channel.workspace_id = e.workspace_id
+WHERE e.workspace_id = sqlc.arg(workspace_id)
+  AND e.cursor > sqlc.arg(cursor)
+  AND (
+    e.is_private = 0
+    OR EXISTS (SELECT 1 FROM event_recipients er WHERE er.event_id = e.id AND er.user_id = sqlc.arg(user_id))
+  )
+  AND (
+    e.type NOT IN ('channel.read', 'dm.read')
+    OR COALESCE(e.payload_json::jsonb ->> 'user_id', '') = sqlc.arg(user_id)
+  )
+  AND (
+    e.channel_id IS NULL
+    OR viewer.role <> 'guest'
+    OR event_channel.name = 'guest'
+  )
+  AND (
+    COALESCE(
+      e.payload_json::jsonb ->> 'direct_conversation_id',
+      (
+        SELECT m.direct_conversation_id
+        FROM messages m
+        WHERE m.workspace_id = e.workspace_id
+          AND m.id IN (
+            COALESCE(e.payload_json::jsonb ->> 'message_id', ''),
+            COALESCE(e.payload_json::jsonb ->> 'root_message_id', '')
+          )
+          AND m.direct_conversation_id IS NOT NULL
+          AND m.direct_conversation_id <> ''
+        LIMIT 1
+      ),
+      ''
+    ) = ''
+    OR (
+      viewer.role <> 'guest'
+      AND EXISTS (
+        SELECT 1
+        FROM direct_conversation_members dcm
+        JOIN direct_conversations dc ON dc.id = dcm.conversation_id
+        WHERE dc.workspace_id = e.workspace_id
+          AND dcm.conversation_id = COALESCE(
+            e.payload_json::jsonb ->> 'direct_conversation_id',
+            (
+              SELECT m.direct_conversation_id
+              FROM messages m
+              WHERE m.workspace_id = e.workspace_id
+                AND m.id IN (
+                  COALESCE(e.payload_json::jsonb ->> 'message_id', ''),
+                  COALESCE(e.payload_json::jsonb ->> 'root_message_id', '')
+                )
+                AND m.direct_conversation_id IS NOT NULL
+                AND m.direct_conversation_id <> ''
+              LIMIT 1
+            )
+          )
+          AND dcm.user_id = sqlc.arg(user_id)
+      )
+    )
+  )
+ORDER BY e.cursor
+LIMIT sqlc.arg(limit_count);
+
+-- name: LatestEventCursor :one
+SELECT e.cursor
+FROM events e
+JOIN workspace_members viewer ON viewer.workspace_id = e.workspace_id AND viewer.user_id = sqlc.arg(user_id)
+LEFT JOIN channels event_channel ON event_channel.id = e.channel_id AND event_channel.workspace_id = e.workspace_id
+WHERE e.workspace_id = sqlc.arg(workspace_id)
+  AND (
+    e.is_private = 0
+    OR EXISTS (SELECT 1 FROM event_recipients er WHERE er.event_id = e.id AND er.user_id = sqlc.arg(user_id))
+  )
+  AND (
+    e.type NOT IN ('channel.read', 'dm.read')
+    OR COALESCE(e.payload_json::jsonb ->> 'user_id', '') = sqlc.arg(user_id)
+  )
+  AND (
+    e.channel_id IS NULL
+    OR viewer.role <> 'guest'
+    OR event_channel.name = 'guest'
+  )
+  AND (
+    COALESCE(
+      e.payload_json::jsonb ->> 'direct_conversation_id',
+      (
+        SELECT m.direct_conversation_id
+        FROM messages m
+        WHERE m.workspace_id = e.workspace_id
+          AND m.id IN (
+            COALESCE(e.payload_json::jsonb ->> 'message_id', ''),
+            COALESCE(e.payload_json::jsonb ->> 'root_message_id', '')
+          )
+          AND m.direct_conversation_id IS NOT NULL
+          AND m.direct_conversation_id <> ''
+        LIMIT 1
+      ),
+      ''
+    ) = ''
+    OR (
+      viewer.role <> 'guest'
+      AND EXISTS (
+        SELECT 1
+        FROM direct_conversation_members dcm
+        JOIN direct_conversations dc ON dc.id = dcm.conversation_id
+        WHERE dc.workspace_id = e.workspace_id
+          AND dcm.conversation_id = COALESCE(
+            e.payload_json::jsonb ->> 'direct_conversation_id',
+            (
+              SELECT m.direct_conversation_id
+              FROM messages m
+              WHERE m.workspace_id = e.workspace_id
+                AND m.id IN (
+                  COALESCE(e.payload_json::jsonb ->> 'message_id', ''),
+                  COALESCE(e.payload_json::jsonb ->> 'root_message_id', '')
+                )
+                AND m.direct_conversation_id IS NOT NULL
+                AND m.direct_conversation_id <> ''
+              LIMIT 1
+            )
+          )
+          AND dcm.user_id = sqlc.arg(user_id)
+      )
+    )
+  )
+ORDER BY e.cursor DESC
+LIMIT 1;
+
+-- name: InsertEvent :exec
+INSERT INTO events (id, cursor, workspace_id, channel_id, type, seq, payload_json, created_at, is_private, mentioned_user_ids)
+VALUES (sqlc.arg(id), sqlc.arg(cursor), sqlc.arg(workspace_id), sqlc.arg(channel_id), sqlc.arg(type), sqlc.arg(seq), sqlc.arg(payload_json), sqlc.arg(created_at), sqlc.arg(is_private), sqlc.arg(mentioned_user_ids)::text::jsonb);
+
+-- name: InsertEventRecipient :exec
+INSERT INTO event_recipients (event_id, user_id)
+VALUES (sqlc.arg(event_id), sqlc.arg(user_id));
+
+-- name: PruneEvents :execrows
+DELETE FROM events AS e
+WHERE e.workspace_id = sqlc.arg(workspace_id_arg)
+  AND (
+    NULLIF(sqlc.arg(before)::text, '') IS NULL
+    OR (
+      CASE
+        WHEN strpos(e.created_at, '.') = 0 THEN replace(e.created_at, 'Z', '.000000000Z')
+        ELSE substring(e.created_at from 1 for strpos(e.created_at, '.')) ||
+             substring(substring(e.created_at from strpos(e.created_at, '.') + 1 for strpos(e.created_at, 'Z') - strpos(e.created_at, '.') - 1) || '000000000' from 1 for 9) ||
+             'Z'
+      END
+    ) < (
+      CASE
+        WHEN strpos(NULLIF(sqlc.arg(before)::text, ''), '.') = 0 THEN replace(NULLIF(sqlc.arg(before)::text, ''), 'Z', '.000000000Z')
+        ELSE substring(NULLIF(sqlc.arg(before)::text, '') from 1 for strpos(NULLIF(sqlc.arg(before)::text, ''), '.')) ||
+             substring(substring(NULLIF(sqlc.arg(before)::text, '') from strpos(NULLIF(sqlc.arg(before)::text, ''), '.') + 1 for strpos(NULLIF(sqlc.arg(before)::text, ''), 'Z') - strpos(NULLIF(sqlc.arg(before)::text, ''), '.') - 1) || '000000000' from 1 for 9) ||
+             'Z'
+      END
+    )
+  )
+  AND e.id NOT IN (
+    SELECT kept.id
+    FROM events AS kept
+    WHERE kept.workspace_id = sqlc.arg(workspace_id_arg)
+    ORDER BY kept.cursor DESC
+    LIMIT sqlc.arg(keep_latest)
+  );
+
+-- name: GetEventDeliveryAttemptCursor :one
+SELECT created_at
+FROM event_delivery_attempts
+WHERE subscription_id = sqlc.arg(subscription_id)
+  AND id = sqlc.arg(before_id);
+
+-- name: ListEventDeliveryAttemptsFirstPage :many
+SELECT eda.id, eda.subscription_id, eda.event_id, eda.workspace_id, eda.event_type,
+       eda.attempt, eda.request_json, eda.response_status, eda.response_body,
+       eda.error, eda.created_at, eda.completed_at
+FROM event_delivery_attempts eda
+WHERE eda.subscription_id = sqlc.arg(subscription_id)
+ORDER BY eda.created_at DESC, eda.id DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: ListEventDeliveryAttemptsPage :many
+SELECT eda.id, eda.subscription_id, eda.event_id, eda.workspace_id, eda.event_type,
+       eda.attempt, eda.request_json, eda.response_status, eda.response_body,
+       eda.error, eda.created_at, eda.completed_at
+FROM event_delivery_attempts eda
+WHERE eda.subscription_id = sqlc.arg(subscription_id)
+  AND (eda.created_at, eda.id) < (
+    sqlc.arg(before_created_at)::text,
+    sqlc.arg(before_id)
+  )
+ORDER BY eda.created_at DESC, eda.id DESC
+LIMIT sqlc.arg(page_limit);
+
+-- name: DeleteBotCommandsForBot :exec
+DELETE FROM bot_commands
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND bot_user_id = sqlc.arg(bot_user_id);
+
+-- name: LockBotCommandSet :one
+SELECT wm.user_id
+FROM workspace_members wm
+JOIN users u ON u.id = wm.user_id AND u.kind = 'bot'
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(bot_user_id)
+  AND wm.role = 'bot'
+FOR UPDATE OF wm;
+
+-- name: LockBotWorkspaceMembership :one
+SELECT wm.user_id
+FROM workspace_members wm
+JOIN users u ON u.id = wm.user_id AND u.kind = 'bot'
+WHERE wm.workspace_id = sqlc.arg(workspace_id)
+  AND wm.user_id = sqlc.arg(bot_user_id)
+FOR UPDATE OF wm;
+
+-- name: InsertBotCommand :exec
+INSERT INTO bot_commands (
+  id, workspace_id, bot_user_id, command, description, args_hint, created_at, updated_at
+) VALUES (
+  sqlc.arg(id), sqlc.arg(workspace_id), sqlc.arg(bot_user_id), sqlc.arg(command),
+  sqlc.arg(description), sqlc.arg(args_hint), sqlc.arg(created_at), sqlc.arg(updated_at)
+);
+
+-- name: ListBotCommandsForBot :many
+SELECT id, workspace_id, bot_user_id, command, description, args_hint, created_at, updated_at
+FROM bot_commands
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND bot_user_id = sqlc.arg(bot_user_id)
+ORDER BY command;
+
+-- name: ListWorkspaceBotCommands :many
+SELECT bc.id, bc.workspace_id, bc.bot_user_id, bc.command, bc.description, bc.args_hint,
+       bc.created_at, bc.updated_at, u.handle AS bot_handle,
+       u.display_name AS bot_display_name, u.avatar_url AS bot_avatar_url
+FROM bot_commands bc
+JOIN users u ON u.id = bc.bot_user_id AND u.kind = 'bot'
+JOIN workspace_members wm
+  ON wm.workspace_id = bc.workspace_id
+ AND wm.user_id = bc.bot_user_id
+ AND wm.role = 'bot'
+WHERE bc.workspace_id = sqlc.arg(workspace_id)
+ORDER BY u.handle, bc.command;
+
+-- name: InsertBotSetupCode :exec
+INSERT INTO bot_setup_codes (id, code_hash, workspace_id, bot_user_id, token_name, scopes_json, defaults_json, created_by, created_at, expires_at)
+VALUES (sqlc.arg(id), sqlc.arg(code_hash), sqlc.arg(workspace_id), sqlc.arg(bot_user_id), sqlc.arg(token_name), sqlc.arg(scopes_json), sqlc.arg(defaults_json), sqlc.arg(created_by), sqlc.arg(created_at), sqlc.arg(expires_at));
+
+-- name: GetBotSetupCodeByHash :one
+SELECT id, code_hash, workspace_id, bot_user_id, token_name, scopes_json, defaults_json, created_by, created_at, expires_at, claimed_at, claimed_token_id
+FROM bot_setup_codes
+WHERE code_hash = sqlc.arg(code_hash);
+
+-- name: LockBotSetupCodeByHash :one
+SELECT id, code_hash, workspace_id, bot_user_id, token_name, scopes_json, defaults_json, created_by, created_at, expires_at, claimed_at, claimed_token_id
+FROM bot_setup_codes
+WHERE code_hash = sqlc.arg(code_hash)
+FOR UPDATE;
+
+-- name: MarkBotSetupCodeClaimed :execrows
+UPDATE bot_setup_codes
+SET claimed_at = sqlc.arg(claimed_at), claimed_token_id = sqlc.arg(claimed_token_id)
+WHERE id = sqlc.arg(id) AND claimed_at IS NULL;
+
+-- name: DeleteUnclaimedBotSetupCodesForTokenName :execrows
+DELETE FROM bot_setup_codes
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND bot_user_id = sqlc.arg(bot_user_id)
+  AND token_name = sqlc.arg(token_name)
+  AND claimed_at IS NULL;
+
+-- name: DeleteBotSetupCodesForWorkspaceBot :execrows
+DELETE FROM bot_setup_codes
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND bot_user_id = sqlc.arg(bot_user_id)
+  AND claimed_at IS NULL;
+
+-- name: DeleteBotSetupCodesForBot :execrows
+DELETE FROM bot_setup_codes
+WHERE bot_user_id = sqlc.arg(bot_user_id)
+  AND claimed_at IS NULL;
+
+-- name: DeleteExpiredBotSetupCodes :execrows
+DELETE FROM bot_setup_codes
+WHERE claimed_at IS NULL AND expires_at <= sqlc.arg(now);
+
+-- name: GetWorkspaceForSetupClaim :one
+SELECT id, route_id, name, slug, icon_url, created_at
+FROM workspaces
+WHERE id = sqlc.arg(workspace_id);
+
+-- name: GetDefaultChannelForSetupClaim :one
+SELECT name
+FROM channels
+WHERE workspace_id = sqlc.arg(workspace_id)
+  AND archived_at IS NULL
+ORDER BY CASE WHEN name = 'general' THEN 0 ELSE 1 END, created_at, id
+LIMIT 1;
+-- name: GetAvailableTopic :one
+SELECT workspace_id, COALESCE(channel_id, '') AS channel_id
+FROM topics
+WHERE id = sqlc.arg(topic_id) AND archived_at IS NULL;
+
+-- name: LatestWorkspaceEventCursor :one
+SELECT cursor FROM events WHERE workspace_id = sqlc.arg(workspace_id) ORDER BY cursor DESC LIMIT 1;
+
+-- name: LockEventWorkspace :one
+SELECT id FROM workspaces WHERE id = sqlc.arg(workspace_id) FOR KEY SHARE;
+
+-- name: LockEventRecipient :one
+SELECT id FROM users WHERE id = sqlc.arg(user_id) FOR KEY SHARE;
+
+-- name: LockWorkspaceEventLog :exec
+SELECT pg_advisory_xact_lock(hashtext('clickclack.events'), hashtext(sqlc.arg(workspace_id)::text));
+
+-- name: ListThreadReplyPage :many
+WITH descending_page AS (
+ SELECT candidate.* FROM messages candidate
+ WHERE candidate.thread_root_id = sqlc.arg(root_id) AND candidate.parent_message_id = sqlc.arg(root_id)
+   AND candidate.thread_seq > sqlc.arg(lower_seq) AND candidate.thread_seq <= sqlc.arg(upper_seq)
+   AND CAST(sqlc.arg(descending_order) AS INTEGER) = 1
+ ORDER BY candidate.thread_seq DESC LIMIT sqlc.arg(page_limit)
+), ascending_page AS (
+ SELECT candidate.* FROM messages candidate
+ WHERE candidate.thread_root_id = sqlc.arg(root_id) AND candidate.parent_message_id = sqlc.arg(root_id)
+   AND candidate.thread_seq > sqlc.arg(lower_seq) AND candidate.thread_seq <= sqlc.arg(upper_seq)
+   AND CAST(sqlc.arg(descending_order) AS INTEGER) = 0
+ ORDER BY candidate.thread_seq ASC LIMIT sqlc.arg(page_limit)
+), page AS (
+ SELECT * FROM descending_page UNION ALL SELECT * FROM ascending_page
+)
+SELECT m.*,
+ u.kind AS author_kind, u.owner_user_id AS author_owner_id, u.display_name AS author_name,
+ u.handle AS author_handle, u.avatar_url AS author_avatar, u.created_at AS author_created,
+ at.former_handle AS author_former_handle, at.deleted_at AS author_deleted,
+ qu.kind AS quote_kind, qu.owner_user_id AS quote_owner_id, qu.display_name AS quote_name,
+ qu.handle AS quote_handle, qu.avatar_url AS quote_avatar, qu.created_at AS quote_created,
+ qt.former_handle AS quote_former_handle, qt.deleted_at AS quote_deleted
+FROM page m
+JOIN users u ON u.id = m.author_id
+LEFT JOIN bot_tombstones at ON at.bot_user_id = u.id
+LEFT JOIN users qu ON qu.id = m.quoted_author_id
+LEFT JOIN bot_tombstones qt ON qt.bot_user_id = qu.id
+ORDER BY m.thread_seq ASC;
+
+-- name: ThreadReplyEdges :one
+SELECT EXISTS(SELECT 1 FROM messages older WHERE older.thread_root_id = sqlc.arg(root_id) AND older.parent_message_id = sqlc.arg(root_id) AND older.thread_seq < sqlc.arg(oldest_seq)) AS has_older,
+       EXISTS(SELECT 1 FROM messages newer WHERE newer.thread_root_id = sqlc.arg(root_id) AND newer.parent_message_id = sqlc.arg(root_id) AND newer.thread_seq > sqlc.arg(newest_seq)) AS has_newer;
+
+-- Password login accepts either an identity email or a handle. Both sides are
+-- folded because identity rows keep the casing they were created with, and two
+-- rows are read so an ambiguous identifier can be rejected rather than guessed.
+-- name: ListPasswordLoginsByIdentifier :many
+SELECT DISTINCT u.id, u.kind, u.owner_user_id, u.display_name, u.handle, u.avatar_url, u.created_at,
+       COALESCE(p.password_hash, '') AS password_hash
+FROM users u
+LEFT JOIN user_passwords p ON p.user_id = u.id
+WHERE u.kind = 'human'
+  AND (
+    (u.handle <> '' AND lower(u.handle) = lower(sqlc.arg(identifier)))
+    OR EXISTS (
+      SELECT 1 FROM identities i
+      WHERE i.user_id = u.id AND lower(i.email) = lower(sqlc.arg(identifier))
+    )
+  )
+ORDER BY u.created_at, u.id
+LIMIT 2;
+
+-- name: UpsertUserPassword :exec
+INSERT INTO user_passwords (user_id, password_hash, updated_at)
+VALUES (sqlc.arg(user_id), sqlc.arg(password_hash), sqlc.arg(updated_at))
+ON CONFLICT(user_id) DO UPDATE SET
+  password_hash = excluded.password_hash,
+  updated_at = excluded.updated_at;
+
+-- name: DeleteUserPassword :execrows
+DELETE FROM user_passwords
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: RevokeSessionByTokenHash :execrows
+UPDATE sessions
+SET revoked_at = sqlc.arg(revoked_at)
+WHERE token_hash = sqlc.arg(token_hash)
+  AND revoked_at IS NULL;
+
+-- name: GetUserPasswordHash :one
+SELECT password_hash
+FROM user_passwords
+WHERE user_id = sqlc.arg(user_id);
+
+-- name: RevokeUserSessionsExceptTokenHash :execrows
+UPDATE sessions
+SET revoked_at = sqlc.arg(revoked_at)
+WHERE user_id = sqlc.arg(user_id)
+  AND revoked_at IS NULL
+  AND token_hash <> sqlc.arg(keep_token_hash);
+
+-- Hold the credential against rotation until the session commits.
+-- name: InsertSessionForVerifiedPassword :execrows
+INSERT INTO sessions (id, token, token_hash, user_id, created_at, expires_at)
+SELECT sqlc.arg(id), sqlc.arg(token), sqlc.arg(token_hash), p.user_id, sqlc.arg(created_at), sqlc.arg(expires_at)
+FROM user_passwords p
+WHERE p.user_id = sqlc.arg(user_id)
+  AND p.password_hash = sqlc.arg(verified_hash)
+FOR SHARE OF p;
+
+-- name: ReplaceVerifiedUserPassword :execrows
+UPDATE user_passwords
+SET password_hash = sqlc.arg(password_hash),
+    updated_at = sqlc.arg(updated_at)
+WHERE user_id = sqlc.arg(user_id)
+  AND password_hash = sqlc.arg(verified_hash);
+
+-- Keep logout from invalidating the caller before rotation commits.
+-- name: GetLiveUserSessionExpiry :one
+SELECT expires_at
+FROM sessions
+WHERE user_id = sqlc.arg(user_id)
+  AND token_hash = sqlc.arg(token_hash)
+  AND revoked_at IS NULL
+FOR UPDATE;
+
+
+-- name: LockUserPushSubscriptions :one
+SELECT id FROM users WHERE id = sqlc.arg(user_id) FOR NO KEY UPDATE;
+
+-- name: UpsertPushSubscription :exec
+INSERT INTO user_push_subscriptions (
+  id, user_id, endpoint, p256dh, auth, user_agent, session_token_hash,
+  created_at, updated_at, failure_count, vapid_key_id
+)
+VALUES (
+  sqlc.arg(id), sqlc.arg(user_id), sqlc.arg(endpoint), sqlc.arg(p256dh), sqlc.arg(auth),
+  sqlc.arg(user_agent), sqlc.arg(session_token_hash), sqlc.arg(created_at), sqlc.arg(updated_at), 0,
+  sqlc.arg(vapid_key_id)
+)
+ON CONFLICT (endpoint) DO UPDATE SET
+  user_id = excluded.user_id,
+  created_at = CASE
+    WHEN user_push_subscriptions.user_id <> excluded.user_id THEN excluded.created_at
+    ELSE user_push_subscriptions.created_at
+  END,
+  p256dh = excluded.p256dh,
+  auth = excluded.auth,
+  user_agent = excluded.user_agent,
+  session_token_hash = excluded.session_token_hash,
+  updated_at = excluded.updated_at,
+  next_attempt_at = NULL,
+  failure_count = 0,
+  failing_since = NULL,
+  last_failure_at = NULL;
+
+-- name: TrimPushSubscriptions :exec
+DELETE FROM user_push_subscriptions
+WHERE user_push_subscriptions.user_id = sqlc.arg(user_id)
+  AND user_push_subscriptions.id NOT IN (
+    SELECT newest.id FROM user_push_subscriptions newest
+    WHERE newest.user_id = sqlc.arg(user_id)
+    ORDER BY newest.created_at DESC, newest.id DESC
+    LIMIT sqlc.arg(keep_count)
+  );
+
+-- name: ListPushSubscriptions :many
+SELECT id, user_id, endpoint, user_agent, created_at, updated_at, last_success_at, next_attempt_at, failure_count, vapid_key_id
+FROM user_push_subscriptions
+WHERE user_id = sqlc.arg(user_id)
+ORDER BY created_at, id;
+
+-- name: GetPushSubscription :one
+SELECT id, user_id, endpoint, user_agent, created_at, updated_at, last_success_at, next_attempt_at, failure_count, vapid_key_id
+FROM user_push_subscriptions
+WHERE user_id = sqlc.arg(user_id) AND endpoint = sqlc.arg(endpoint);
+
+-- name: DeletePushSubscription :exec
+DELETE FROM user_push_subscriptions
+WHERE user_id = sqlc.arg(user_id) AND endpoint = sqlc.arg(endpoint);
+
+-- name: MarkPushSubscriptionSuccess :exec
+UPDATE user_push_subscriptions
+SET last_success_at = sqlc.arg(last_success_at),
+    updated_at = sqlc.arg(updated_at),
+    next_attempt_at = NULL,
+    failure_count = 0,
+    failing_since = NULL,
+    last_failure_at = NULL
+WHERE user_id = sqlc.arg(user_id) AND endpoint = sqlc.arg(endpoint);
+
+-- name: MarkPushSubscriptionFailure :one
+UPDATE user_push_subscriptions
+SET failure_count = failure_count + 1,
+    failing_since = COALESCE(failing_since, sqlc.arg(updated_at)),
+    updated_at = sqlc.arg(updated_at),
+    last_failure_at = sqlc.arg(updated_at)
+WHERE user_id = sqlc.arg(user_id) AND endpoint = sqlc.arg(endpoint)
+RETURNING failure_count;
+
+-- name: SetPushSubscriptionNextAttempt :exec
+UPDATE user_push_subscriptions
+SET next_attempt_at = sqlc.arg(next_attempt_at)
+WHERE user_id = sqlc.arg(user_id) AND endpoint = sqlc.arg(endpoint);
+
+-- name: GetPushSubscriptionDelivery :one
+SELECT ups.user_id, ups.endpoint, ups.p256dh, ups.auth, ups.next_attempt_at, ups.session_token_hash, ups.vapid_key_id,
+       s.user_id AS session_user_id, s.expires_at AS session_expires_at, s.revoked_at AS session_revoked_at
+FROM user_push_subscriptions ups
+LEFT JOIN sessions s
+  ON s.token_hash = ups.session_token_hash AND ups.session_token_hash <> ''
+WHERE ups.user_id = sqlc.arg(user_id) AND ups.endpoint = sqlc.arg(endpoint);
+
+-- name: ListPushSubscriptionsForUsers :many
+SELECT ups.user_id, ups.endpoint, ups.p256dh, ups.auth, ups.next_attempt_at, ups.vapid_key_id,
+       s.expires_at AS session_expires_at
+FROM user_push_subscriptions ups
+LEFT JOIN sessions s
+  ON s.token_hash = ups.session_token_hash AND ups.session_token_hash <> ''
+WHERE ups.user_id = ANY(sqlc.arg(user_ids)::text[])
+  AND (
+    ups.session_token_hash = ''
+    OR (s.id IS NOT NULL AND s.revoked_at IS NULL)
+  )
+ORDER BY ups.user_id, ups.created_at, ups.id;
+
+-- name: PruneFailingPushSubscriptions :execrows
+DELETE FROM user_push_subscriptions
+WHERE failing_since IS NOT NULL
+  AND failing_since < sqlc.arg(failing_before)
+  AND last_failure_at IS NOT NULL
+  AND last_failure_at >= sqlc.arg(last_failure_since)
+  AND failure_count >= sqlc.arg(min_failures);
+
+-- name: PruneRetiredKeyPushSubscriptions :execrows
+DELETE FROM user_push_subscriptions
+WHERE vapid_key_id <> ''
+  AND vapid_key_id <> sqlc.arg(current_key_id)
+  AND updated_at < sqlc.arg(updated_before);
+
+-- name: PruneEndedSessionPushSubscriptions :execrows
+DELETE FROM user_push_subscriptions
+WHERE session_token_hash <> ''
+  AND NOT EXISTS (
+    SELECT 1 FROM sessions s
+    WHERE s.token_hash = user_push_subscriptions.session_token_hash
+      AND s.revoked_at IS NULL
+      AND s.expires_at > sqlc.arg(now)
+  );

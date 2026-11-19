@@ -1,0 +1,319 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLoadDefaultsEnvAndFile(t *testing.T) {
+	t.Setenv("CLICKCLACK_ADDR", ":9000")
+	t.Setenv("CLICKCLACK_DATA", "/tmp/clickclack")
+	t.Setenv("CLICKCLACK_DB", "sqlite:///tmp/clickclack.db")
+	t.Setenv("CLICKCLACK_UPLOADS", "r2://clickclack-uploads/prod")
+	t.Setenv("CLICKCLACK_ENVIRONMENT", "fakeco")
+	t.Setenv("CLICKCLACK_METRICS_ENABLED", "true")
+	t.Setenv("CLICKCLACK_PUBLIC_URL", "https://clickclack.test")
+	t.Setenv("CLICKCLACK_PUBLIC_API_URL", "https://api.clickclack.test/services/clickclack/")
+	t.Setenv("CLICKCLACK_EMBED_FRAME_ANCESTORS", "https://control.example.com, https://dock.example.com")
+	t.Setenv("CLICKCLACK_COOKIE_NAMESPACE", "prod-2")
+	t.Setenv("CLICKCLACK_DEV_BOOTSTRAP", "false")
+	t.Setenv("CLICKCLACK_GITHUB_CLIENT_ID", "client")
+	t.Setenv("CLICKCLACK_GITHUB_CLIENT_SECRET", "secret")
+	t.Setenv("CLICKCLACK_GITHUB_ALLOWED_ORG", "openclaw")
+	t.Setenv("CLICKCLACK_GITHUB_MODERATOR_ORG", "openclaw")
+	t.Setenv("OPENCLAW_ID_CLIENT_ID", "ocid-client")
+	t.Setenv("OPENCLAW_ID_CLIENT_SECRET", "ocid-secret")
+	t.Setenv("OPENCLAW_ID_ISSUER", "https://id.openclaw.test/api/auth")
+	t.Setenv("CLICKCLACK_PUSHOVER_API_TOKEN", "app-token")
+	t.Setenv("CLICKCLACK_R2_ACCOUNT_ID", "account")
+	t.Setenv("CLICKCLACK_R2_ACCESS_KEY_ID", "access")
+	t.Setenv("CLICKCLACK_R2_SECRET_ACCESS_KEY", "secret-access")
+	t.Setenv("CLICKCLACK_R2_ENDPOINT", "https://r2.example.com")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Addr != ":9000" || cfg.Data != "/tmp/clickclack" || cfg.DB != "sqlite:///tmp/clickclack.db" || cfg.Uploads != "r2://clickclack-uploads/prod" || cfg.Environment != "fakeco" || !cfg.MetricsEnabled || cfg.PublicURL != "https://clickclack.test" || cfg.PublicAPIURL != "https://api.clickclack.test/services/clickclack/" || len(cfg.EmbedFrameAncestors) != 2 || cfg.EmbedFrameAncestors[0] != "https://control.example.com" || cfg.CookieNamespace != "prod-2" || cfg.DevBootstrap || cfg.GitHubClientID != "client" || cfg.GitHubClientSecret != "secret" || cfg.GitHubAllowedOrg != "openclaw" || cfg.GitHubModeratorOrg != "openclaw" || cfg.PushoverAPIToken != "app-token" || cfg.R2AccountID != "account" || cfg.R2AccessKeyID != "access" || cfg.R2SecretAccessKey != "secret-access" || cfg.R2Endpoint != "https://r2.example.com" {
+		t.Fatalf("unexpected env config: %#v", cfg)
+	}
+	if cfg.OpenClawIDClientID != "ocid-client" || cfg.OpenClawIDClientSecret != "ocid-secret" || cfg.OpenClawIDIssuer != "https://id.openclaw.test/api/auth" {
+		t.Fatalf("unexpected OpenClaw ID env config: %#v", cfg)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"addr":":7000","data":"/data"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Addr != ":9000" || cfg.Data != "/tmp/clickclack" || cfg.DB != "sqlite:///tmp/clickclack.db" {
+		t.Fatalf("expected env to override file config: %#v", cfg)
+	}
+
+	t.Setenv("CLICKCLACK_ADDR", "")
+	t.Setenv("CLICKCLACK_DATA", "")
+	t.Setenv("CLICKCLACK_DB", "")
+	t.Setenv("CLICKCLACK_UPLOADS", "")
+	t.Setenv("CLICKCLACK_ENVIRONMENT", "")
+	t.Setenv("CLICKCLACK_METRICS_ENABLED", "")
+	t.Setenv("CLICKCLACK_PUBLIC_URL", "")
+	t.Setenv("CLICKCLACK_PUBLIC_API_URL", "")
+	t.Setenv("CLICKCLACK_EMBED_FRAME_ANCESTORS", "")
+	t.Setenv("CLICKCLACK_COOKIE_NAMESPACE", "")
+	t.Setenv("CLICKCLACK_DEV_BOOTSTRAP", "")
+	t.Setenv("CLICKCLACK_GITHUB_CLIENT_ID", "")
+	t.Setenv("CLICKCLACK_GITHUB_CLIENT_SECRET", "")
+	t.Setenv("CLICKCLACK_GITHUB_ALLOWED_ORG", "")
+	t.Setenv("CLICKCLACK_GITHUB_MODERATOR_ORG", "")
+	t.Setenv("OPENCLAW_ID_CLIENT_ID", "")
+	t.Setenv("OPENCLAW_ID_CLIENT_SECRET", "")
+	t.Setenv("OPENCLAW_ID_ISSUER", "")
+	t.Setenv("CLICKCLACK_PUSHOVER_API_TOKEN", "")
+	t.Setenv("CLICKCLACK_R2_ACCOUNT_ID", "")
+	t.Setenv("CLICKCLACK_R2_ACCESS_KEY_ID", "")
+	t.Setenv("CLICKCLACK_R2_SECRET_ACCESS_KEY", "")
+	t.Setenv("CLICKCLACK_R2_ENDPOINT", "")
+	emptyPath := filepath.Join(t.TempDir(), "empty.json")
+	if err := os.WriteFile(emptyPath, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(emptyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Addr != ":8080" || cfg.Data != "./data" || cfg.DevBootstrap {
+		t.Fatalf("unexpected fallback config: %#v", cfg)
+	}
+	if _, err := Load(filepath.Join(t.TempDir(), "missing.json")); err == nil {
+		t.Fatal("expected missing config error")
+	}
+	t.Setenv("CLICKCLACK_METRICS_ENABLED", "not-bool")
+	if _, err := Load(""); err == nil {
+		t.Fatal("expected bad metrics bool env error")
+	}
+	t.Setenv("CLICKCLACK_METRICS_ENABLED", "")
+	t.Setenv("CLICKCLACK_DEV_BOOTSTRAP", "not-bool")
+	if _, err := Load(""); err == nil {
+		t.Fatal("expected bad bool env error")
+	}
+	overrideBoolPath := filepath.Join(t.TempDir(), "override-bool.json")
+	if err := os.WriteFile(overrideBoolPath, []byte(`{"dev_bootstrap":false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(overrideBoolPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DevBootstrap {
+		t.Fatalf("expected file boolean to override invalid env: %#v", cfg)
+	}
+	t.Setenv("CLICKCLACK_DEV_BOOTSTRAP", "")
+	badPath := filepath.Join(t.TempDir(), "bad.json")
+	if err := os.WriteFile(badPath, []byte(`{`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(badPath); err == nil {
+		t.Fatal("expected bad json error")
+	}
+}
+
+func TestValidateServe(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		PublicURL:          "https://Chat.Example.com:443/",
+		CookieNamespace:    " prod-2 ",
+		GitHubClientID:     " client ",
+		GitHubClientSecret: " secret ",
+		GitHubAllowedOrg:   " openclaw ",
+	}
+	if err := cfg.ValidateServe(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PublicURL != "https://chat.example.com" || cfg.CookieNamespace != "prod-2" || cfg.GitHubClientID != "client" || cfg.GitHubClientSecret != "secret" || cfg.GitHubAllowedOrg != "openclaw" {
+		t.Fatalf("unexpected validated config: %#v", cfg)
+	}
+
+	disabled := Config{GitHubClientID: " ", GitHubClientSecret: "\t"}
+	if err := disabled.ValidateServe(); err != nil {
+		t.Fatal(err)
+	}
+	if disabled.GitHubClientID != "" || disabled.GitHubClientSecret != "" {
+		t.Fatalf("expected whitespace credentials to normalize as disabled: %#v", disabled)
+	}
+	sameOrigin := Config{PublicURL: "https://chat.example.com"}
+	if err := sameOrigin.ValidateServe(); err != nil || sameOrigin.PublicAPIURL != sameOrigin.PublicURL {
+		t.Fatalf("expected public API URL to default to public URL: %#v %v", sameOrigin, err)
+	}
+	splitOrigin := Config{PublicURL: "https://chat.example.com", PublicAPIURL: "https://API.Example.com:443/services/clickclack/"}
+	if err := splitOrigin.ValidateServe(); err != nil || splitOrigin.PublicAPIURL != "https://api.example.com/services/clickclack" {
+		t.Fatalf("expected canonical split API URL: %#v %v", splitOrigin, err)
+	}
+	embedOrigins := Config{EmbedFrameAncestors: []string{"HTTPS://Control.Example.com/", "https://control.example.com", "http://localhost:3000"}}
+	if err := embedOrigins.ValidateServe(); err != nil {
+		t.Fatal(err)
+	}
+	if len(embedOrigins.EmbedFrameAncestors) != 2 || embedOrigins.EmbedFrameAncestors[0] != "https://control.example.com" || embedOrigins.EmbedFrameAncestors[1] != "http://localhost:3000" {
+		t.Fatalf("unexpected normalized embed origins: %#v", embedOrigins.EmbedFrameAncestors)
+	}
+
+	for _, tc := range []struct {
+		name string
+		cfg  Config
+	}{
+		{"invalid namespace", Config{CookieNamespace: "__Host-session", PublicURL: "https://chat.example.com"}},
+		{"namespace without public url", Config{CookieNamespace: "prod"}},
+		{"non-https remote url", Config{PublicURL: "http://chat.example.com"}},
+		{"public url path", Config{PublicURL: "https://chat.example.com/app"}},
+		{"public api url query", Config{PublicURL: "https://chat.example.com", PublicAPIURL: "https://api.example.com?x=1"}},
+		{"mixed loopback schemes", Config{PublicURL: "http://localhost:8080", PublicAPIURL: "https://localhost:8443"}},
+		{"different loopback hosts", Config{PublicURL: "http://localhost:8080", PublicAPIURL: "http://127.0.0.1:8081"}},
+		{"missing client secret", Config{PublicURL: "https://chat.example.com", GitHubClientID: "client"}},
+		{"oauth without public url", Config{GitHubClientID: "client", GitHubClientSecret: "secret"}},
+		{"org without oauth", Config{GitHubAllowedOrg: "openclaw"}},
+		{"missing openclaw id client secret", Config{PublicURL: "https://chat.example.com", OpenClawIDClientID: "client"}},
+		{"openclaw id without public url", Config{OpenClawIDClientID: "client", OpenClawIDClientSecret: "secret"}},
+		{"access domain only", Config{AccessTeamDomain: "https://openclaw.cloudflareaccess.com"}},
+		{"access audience only", Config{AccessAUD: "test-aud"}},
+		{"access domain must use https", Config{AccessTeamDomain: "http://openclaw.cloudflareaccess.com", AccessAUD: "test-aud"}},
+		{"access domain must be an origin", Config{AccessTeamDomain: "https://openclaw.cloudflareaccess.com/path", AccessAUD: "test-aud"}},
+		{"invalid embed ancestor", Config{EmbedFrameAncestors: []string{"https://control.example.com/path"}}},
+		{"wildcard embed ancestor", Config{EmbedFrameAncestors: []string{"https://*.example.com"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := tc.cfg.ValidateServe(); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestValidateAccessConfig(t *testing.T) {
+	t.Parallel()
+	cfg := Config{AccessTeamDomain: " https://OpenClaw.cloudflareaccess.com:443/ ", AccessAUD: " test-access-aud "}
+	if err := cfg.ValidateServe(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccessTeamDomain != "https://openclaw.cloudflareaccess.com" || cfg.AccessAUD != "test-access-aud" {
+		t.Fatalf("unexpected validated Access config: %#v", cfg)
+	}
+}
+
+func TestLoadAccessConfigFromEnvironmentAndJSON(t *testing.T) {
+	t.Setenv("CLICKCLACK_ACCESS_TEAM_DOMAIN", "https://env.cloudflareaccess.com")
+	t.Setenv("CLICKCLACK_ACCESS_AUD", "test-env-aud")
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"access_team_domain":"https://file.cloudflareaccess.com","access_aud":"test-file-aud"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccessTeamDomain != "https://env.cloudflareaccess.com" || cfg.AccessAUD != "test-env-aud" {
+		t.Fatalf("environment did not override Access JSON config: %#v", cfg)
+	}
+	t.Setenv("CLICKCLACK_ACCESS_TEAM_DOMAIN", "")
+	t.Setenv("CLICKCLACK_ACCESS_AUD", "")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccessTeamDomain != "https://file.cloudflareaccess.com" || cfg.AccessAUD != "test-file-aud" {
+		t.Fatalf("Access JSON config was not loaded: %#v", cfg)
+	}
+}
+
+func TestNormalizeHomeLink(t *testing.T) {
+	cases := []struct {
+		name      string
+		url       string
+		label     string
+		wantURL   string
+		wantLabel string
+		wantErr   bool
+	}{
+		{name: "empty keeps defaults", wantURL: "", wantLabel: ""},
+		{name: "absolute https", url: " https://mfs.example.com/ ", label: " MFS ", wantURL: "https://mfs.example.com/", wantLabel: "MFS"},
+		{name: "absolute path", url: "/app", label: "Home", wantURL: "/app", wantLabel: "Home"},
+		{name: "label only", label: "MFS", wantLabel: "MFS"},
+		{name: "javascript scheme", url: "javascript:alert(1)", wantErr: true},
+		{name: "protocol relative", url: "//evil.example.com", wantErr: true},
+		{name: "slash backslash", url: "/\\evil.example.com", wantErr: true},
+		{name: "slash tab slash", url: "/\t/evil.example.com", wantErr: true},
+		{name: "slash newline slash", url: "/\n/evil.example.com", wantErr: true},
+		{name: "slash carriage return slash", url: "/\r/evil.example.com", wantErr: true},
+		{name: "absolute URL with backslash", url: "https://good.example.com\\@evil.example.com", wantErr: true},
+		{name: "control in query", url: "/portal?q=\x7f", wantErr: true},
+		{name: "credentials", url: "https://user:password@example.com/portal", wantErr: true},
+		{name: "leading control", url: "\n/portal", wantErr: true},
+		{name: "path query and fragment", url: "/portal?from=chat#latest", wantURL: "/portal?from=chat#latest"},
+		{name: "absolute http", url: "http://localhost:8080/portal", wantURL: "http://localhost:8080/portal"},
+		{name: "unicode label", label: strings.Repeat("🦞", 32), wantLabel: strings.Repeat("🦞", 32)},
+		{name: "relative path", url: "app", wantErr: true},
+		{name: "label too long", url: "/app", label: strings.Repeat("x", MaxHomeLabelLength+1), wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.HomeURL, cfg.HomeLabel = tc.url, tc.label
+			err := cfg.ValidateServe()
+			gotURL, gotLabel := cfg.HomeURL, cfg.HomeLabel
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got url=%q label=%q", gotURL, gotLabel)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if gotURL != tc.wantURL || gotLabel != tc.wantLabel {
+				t.Fatalf("got url=%q label=%q, want url=%q label=%q", gotURL, gotLabel, tc.wantURL, tc.wantLabel)
+			}
+		})
+	}
+}
+
+func TestValidateServeRejectsBadHomeLink(t *testing.T) {
+	cfg := Defaults()
+	cfg.HomeURL = "ftp://files.example.com"
+	if err := cfg.ValidateServe(); err == nil || !strings.Contains(err.Error(), "CLICKCLACK_HOME_URL") {
+		t.Fatalf("expected home URL error, got %v", err)
+	}
+	cfg = Defaults()
+	cfg.HomeURL = " https://mfs.example.com "
+	cfg.HomeLabel = " MFS "
+	if err := cfg.ValidateServe(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HomeURL != "https://mfs.example.com" || cfg.HomeLabel != "MFS" {
+		t.Fatalf("expected trimmed home link, got url=%q label=%q", cfg.HomeURL, cfg.HomeLabel)
+	}
+}
+
+func TestLoadPasswordAuthFlag(t *testing.T) {
+	if cfg, err := Load(""); err != nil || cfg.PasswordAuthEnabled {
+		t.Fatalf("expected password auth to default off, got %#v err=%v", cfg, err)
+	}
+	t.Setenv("CLICKCLACK_PASSWORD_AUTH_ENABLED", "true")
+	cfg, err := Load("")
+	if err != nil || !cfg.PasswordAuthEnabled {
+		t.Fatalf("expected the environment to enable password auth, got %#v err=%v", cfg, err)
+	}
+	t.Setenv("CLICKCLACK_PASSWORD_AUTH_ENABLED", "not-bool")
+	if _, err := Load(""); err == nil {
+		t.Fatal("expected an invalid password auth bool to be rejected")
+	}
+	t.Setenv("CLICKCLACK_PASSWORD_AUTH_ENABLED", "")
+	configPath := filepath.Join(t.TempDir(), "password-auth.json")
+	if err := os.WriteFile(configPath, []byte(`{"password_auth_enabled":true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err := Load(configPath); err != nil || !cfg.PasswordAuthEnabled {
+		t.Fatalf("expected the config file to enable password auth, got %#v err=%v", cfg, err)
+	}
+}

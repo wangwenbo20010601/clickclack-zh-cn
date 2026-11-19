@@ -1,0 +1,51 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "clickclack-zh-cn",
+  "account_id": "REPLACE_WITH_YOUR_ACCOUNT_ID",
+  "main": "infra/cloudflare/worker.ts",
+  "compatibility_date": "2026-05-17",
+  "workers_dev": true,
+  "routes": [],
+  "vars": {
+    "CLICKCLACK_PUBLIC_URL": "https://your-instance.example.com",
+    "CLICKCLACK_CONTAINER_NAME": "your-instance",
+    "CLICKCLACK_GITHUB_MODERATOR_ORG": "YOUR_GITHUB_ORG",
+    "CLICKCLACK_UPLOADS": "r2://your-bucket/uploads",
+    "CLICKCLACK_R2_ACCOUNT_ID": "REPLACE_WITH_YOUR_ACCOUNT_ID"
+  },
+  "secrets": {
+    "required": [
+      "CLICKCLACK_DB",
+      "CLICKCLACK_GITHUB_CLIENT_ID",
+      "CLICKCLACK_GITHUB_CLIENT_SECRET",
+      "CLICKCLACK_R2_ACCESS_KEY_ID",
+      "CLICKCLACK_R2_SECRET_ACCESS_KEY"
+    ]
+  },
+  "containers": [
+    {
+      "class_name": "ClickClackContainer",
+      "image": "./Dockerfile.cloudflare",
+      "image_build_context": ".",
+      "instance_type": "basic",
+      "max_instances": 2,
+      "rollout_step_percentage": 100
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CLICKCLACK_CONTAINER",
+        "class_name": "ClickClackContainer"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "ClickClackContainer"
+      ]
+    }
+  ]
+}

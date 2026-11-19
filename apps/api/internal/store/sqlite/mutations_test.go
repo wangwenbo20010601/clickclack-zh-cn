@@ -1,0 +1,703 @@
+package sqlite
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/openclaw/clickclack/apps/api/internal/store"
+	"github.com/openclaw/clickclack/apps/api/internal/store/sqlite/storedb"
+	"github.com/openclaw/clickclack/apps/api/internal/store/storetest"
+)
+
+func TestMutationsCreateDurableEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel := channels[0]
+
+	archived := true
+	updatedChannel, channelEvent, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, Name: "harbor", Archived: &archived})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedChannel.Name != "harbor" || updatedChannel.ArchivedAt == nil || channelEvent.Type != "channel.updated" {
+		t.Fatalf("unexpected channel update: %#v %#v", updatedChannel, channelEvent)
+	}
+	archived = false
+	updatedChannel, _, err = st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, Kind: "private", Archived: &archived})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedChannel.Kind != "private" || updatedChannel.ArchivedAt != nil {
+		t.Fatalf("unexpected channel unarchive: %#v", updatedChannel)
+	}
+
+	message, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channel.ID, AuthorID: owner.ID, Body: "before"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedMessage, updateEvent, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: message.ID, UserID: owner.ID, Body: "after"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedMessage.Body != "after" || updatedMessage.EditedAt == nil || updateEvent.Type != "message.updated" {
+		t.Fatalf("unexpected message update: %#v %#v", updatedMessage, updateEvent)
+	}
+	deletedMessage, deleteEvents, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: message.ID, UserID: owner.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deletedMessage.DeletedAt == nil || len(deleteEvents) != 1 || deleteEvents[0].Type != "message.deleted" {
+		t.Fatalf("unexpected message delete: %#v %#v", deletedMessage, deleteEvents)
+	}
+	repeatedDelete, repeatedDeleteEvents, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: message.ID, UserID: owner.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeatedDelete.DeletedAt == nil || *repeatedDelete.DeletedAt != *deletedMessage.DeletedAt || len(repeatedDeleteEvents) != 0 {
+		t.Fatalf("expected repeated delete to preserve state without event, got %#v %#v", repeatedDelete, repeatedDeleteEvents)
+	}
+	second, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Second", Email: "second@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspaces[0].ID, second.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspaces[0].ID, UserID: owner.ID, MemberIDs: []string{second.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dmMessage, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: dm.ID, AuthorID: owner.ID, Body: "dm before"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: dmMessage.ID, UserID: second.ID, Body: "dm after"}); err == nil {
+		t.Fatal("expected non-author DM member update to be rejected")
+	}
+	updatedDM, dmEvent, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: dmMessage.ID, UserID: owner.ID, Body: "dm after"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedDM.DirectConversationID != dm.ID || dmEvent.ChannelID != "" {
+		t.Fatalf("unexpected dm update: %#v %#v", updatedDM, dmEvent)
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: dmMessage.ID, UserID: second.ID}); err == nil {
+		t.Fatal("expected non-author DM member delete to be rejected")
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: dmMessage.ID, UserID: owner.ID}); err != nil {
+		t.Fatal(err)
+	}
+	dmBySecond, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: dm.ID, AuthorID: second.ID, Body: "dm by second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: dmBySecond.ID, UserID: owner.ID}); !errors.Is(err, store.ErrMessageNotWritable) {
+		t.Fatalf("expected owner non-author DM participant delete to be rejected, got %v", err)
+	}
+	events, err := st.ListEventsAfter(ctx, workspaces[0].ID, owner.ID, "", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	deletedEvents := 0
+	for _, event := range events {
+		seen[event.Type] = true
+		if event.Type == "message.deleted" {
+			deletedEvents++
+		}
+	}
+	for _, eventType := range []string{"channel.updated", "message.updated", "message.deleted"} {
+		if !seen[eventType] {
+			t.Fatalf("missing event %s in %#v", eventType, events)
+		}
+	}
+	if deletedEvents != 2 {
+		t.Fatalf("expected one delete event per deleted message, got %d in %#v", deletedEvents, events)
+	}
+}
+
+func TestManagedChannelFieldsRoundTripAndClear(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Managed Owner", "managed-owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channel, _, err := st.CreateChannel(ctx, store.CreateChannelInput{
+		WorkspaceID:     workspaces[0].ID,
+		UserID:          owner.ID,
+		Name:            "managed-session",
+		ExternalManaged: true,
+		ExternalRef:     "  session:alpha  ",
+		ExternalURL:     "  https://control.example.com/sessions/alpha  ",
+		SidebarSection:  "  Sessions  ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !channel.ExternalManaged || channel.ExternalRef == nil || *channel.ExternalRef != "session:alpha" || channel.ExternalURL == nil || *channel.ExternalURL != "https://control.example.com/sessions/alpha" || channel.SidebarSection == nil || *channel.SidebarSection != "Sessions" {
+		t.Fatalf("unexpected created managed channel: %#v", channel)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed store.Channel
+	for _, candidate := range channels {
+		if candidate.ID == channel.ID {
+			listed = candidate
+			break
+		}
+	}
+	if listed.ID == "" || !listed.ExternalManaged || listed.ExternalRef == nil || *listed.ExternalRef != "session:alpha" || listed.ExternalURL == nil || listed.SidebarSection == nil {
+		t.Fatalf("managed fields missing from channel list: %#v", listed)
+	}
+
+	clear := ""
+	managed := false
+	archived := true
+	updated, event, err := st.UpdateChannel(ctx, store.UpdateChannelInput{
+		ChannelID:       channel.ID,
+		UserID:          owner.ID,
+		Archived:        &archived,
+		ExternalManaged: &managed,
+		ExternalRef:     &clear,
+		ExternalURL:     &clear,
+		SidebarSection:  &clear,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.ExternalManaged || updated.ExternalRef != nil || updated.ExternalURL != nil || updated.SidebarSection != nil || updated.ArchivedAt == nil {
+		t.Fatalf("managed fields were not cleared: %#v", updated)
+	}
+	payload, ok := event.Payload.(map[string]any)
+	if !ok || payload["archived"] != true || payload["channel_id"] != channel.ID {
+		t.Fatalf("channel.updated archive metadata missing: %#v", event.Payload)
+	}
+}
+
+func TestChannelDisplayTitleRoundTripAndClear(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Display Owner", "display-owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	longTitle := "  " + strings.Repeat("界", 205) + "  "
+	channel, _, err := st.CreateChannel(ctx, store.CreateChannelInput{
+		WorkspaceID:  workspaces[0].ID,
+		UserID:       owner.ID,
+		Name:         "display-session",
+		DisplayTitle: longTitle,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if channel.DisplayTitle == nil || len([]rune(*channel.DisplayTitle)) != 200 || strings.Contains(*channel.DisplayTitle, " ") {
+		t.Fatalf("display title was not trimmed and rune-truncated: %#v", channel.DisplayTitle)
+	}
+	listed, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, candidate := range listed {
+		if candidate.ID == channel.ID {
+			found = candidate.DisplayTitle != nil && *candidate.DisplayTitle == *channel.DisplayTitle
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("display title missing from channel list: %#v", listed)
+	}
+	got, err := st.GetChannel(ctx, channel.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.DisplayTitle == nil || *got.DisplayTitle != *channel.DisplayTitle {
+		t.Fatalf("display title missing from channel get: %#v", got)
+	}
+	trailingBoundary := strings.Repeat("界", 199) + "  X"
+	updated, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, DisplayTitle: &trailingBoundary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DisplayTitle == nil || len([]rune(*updated.DisplayTitle)) != 199 || strings.HasSuffix(*updated.DisplayTitle, " ") {
+		t.Fatalf("truncated display title retained boundary whitespace: %#v", updated.DisplayTitle)
+	}
+	next := "  Sensible Work Tree Naming Scheme  "
+	updated, _, err = st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, DisplayTitle: &next})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DisplayTitle == nil || *updated.DisplayTitle != "Sensible Work Tree Naming Scheme" {
+		t.Fatalf("display title was not updated: %#v", updated.DisplayTitle)
+	}
+	clear := "  "
+	updated, _, err = st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channel.ID, UserID: owner.ID, DisplayTitle: &clear})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DisplayTitle != nil {
+		t.Fatalf("display title was not cleared: %#v", updated.DisplayTitle)
+	}
+}
+
+func TestGuestChannelNameIsReserved(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner-reserved@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.EnsureDefaultGuestWorkspaceMember(ctx, owner.ID, store.WorkspaceRoleOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.CreateChannel(ctx, store.CreateChannelInput{WorkspaceID: workspace.ID, UserID: owner.ID, Name: "guest"}); err == nil {
+		t.Fatal("expected guest channel create to be rejected")
+	}
+	general, _, err := st.CreateChannel(ctx, store.CreateChannelInput{WorkspaceID: workspace.ID, UserID: owner.ID, Name: "general-chat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: general.ID, UserID: owner.ID, Name: "guest"}); err == nil {
+		t.Fatal("expected rename to guest to be rejected")
+	}
+	channels, err := st.ListChannels(ctx, workspace.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var guestID string
+	for _, channel := range channels {
+		if channel.Name == store.GuestChannelName {
+			guestID = channel.ID
+			break
+		}
+	}
+	if guestID == "" {
+		t.Fatalf("expected internal guest channel in %#v", channels)
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: guestID, UserID: owner.ID, Name: "renamed-guest"}); err == nil {
+		t.Fatal("expected rename from guest to be rejected")
+	}
+	archived := true
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: guestID, UserID: owner.ID, Archived: &archived}); err != nil {
+		t.Fatalf("expected non-rename guest channel update to remain allowed: %v", err)
+	}
+}
+
+func TestUpdateWorkspaceValidatesIconUpload(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner-icon@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := workspaces[0]
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "member-icon@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, member.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	third, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Third", Email: "third-icon@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspace.ID, third.ID, store.WorkspaceRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	otherWorkspace, err := st.CreateWorkspace(ctx, store.CreateWorkspaceInput{Name: "Other", Slug: "other-icons"}, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	textUpload, err := storetest.CreateUpload(ctx, st, store.CreateUploadInput{
+		WorkspaceID: workspace.ID,
+		OwnerID:     owner.ID,
+		Filename:    "note.txt",
+		ContentType: "text/plain",
+		ByteSize:    5,
+		StoragePath: "memory://note.txt",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherUpload, err := storetest.CreateUpload(ctx, st, store.CreateUploadInput{
+		WorkspaceID: otherWorkspace.ID,
+		OwnerID:     owner.ID,
+		Filename:    "other.png",
+		ContentType: "image/png",
+		ByteSize:    5,
+		StoragePath: "memory://other.png",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	imageUpload, err := storetest.CreateUpload(ctx, st, store.CreateUploadInput{
+		WorkspaceID: workspace.ID,
+		OwnerID:     owner.ID,
+		Filename:    "icon.png",
+		ContentType: "image/png",
+		ByteSize:    5,
+		StoragePath: "memory://icon.png",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	privateMemberUpload, err := storetest.CreateUpload(ctx, st, store.CreateUploadInput{
+		WorkspaceID: workspace.ID,
+		OwnerID:     member.ID,
+		Filename:    "member-private.png",
+		ContentType: "image/png",
+		ByteSize:    5,
+		StoragePath: "memory://member-private.png",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, iconURL := range map[string]string{
+		"missing upload":         "/api/uploads/upl_missing",
+		"non-image upload":       "/api/uploads/" + textUpload.ID,
+		"other workspace upload": "/api/uploads/" + otherUpload.ID,
+		"other member private":   "/api/uploads/" + privateMemberUpload.ID,
+	} {
+		iconURL := iconURL
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := st.UpdateWorkspace(ctx, store.UpdateWorkspaceInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, IconURL: &iconURL}); err == nil {
+				t.Fatal("expected icon validation error")
+			}
+		})
+	}
+
+	iconURL := "/api/uploads/" + imageUpload.ID
+	updated, event, err := st.UpdateWorkspace(ctx, store.UpdateWorkspaceInput{WorkspaceID: workspace.ID, ActorUserID: owner.ID, IconURL: &iconURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.IconURL != iconURL || event.Type != "workspace.updated" {
+		t.Fatalf("unexpected workspace icon update: %#v %#v", updated, event)
+	}
+	dm, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspace.ID, UserID: owner.ID, MemberIDs: []string{member.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: dm.ID, AuthorID: owner.ID, Body: "private icon attachment"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AttachUpload(ctx, store.AttachUploadInput{MessageID: message.ID, UploadID: imageUpload.ID, UserID: owner.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetUpload(ctx, imageUpload.ID, third.ID); err != nil {
+		t.Fatalf("expected published icon to be visible despite private attachment: %v", err)
+	}
+	if _, _, err := st.TransferWorkspaceOwnership(ctx, store.TransferWorkspaceOwnershipInput{
+		WorkspaceID: workspace.ID, ActorUserID: owner.ID, NewOwnerUserID: member.ID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updatedName := "Renamed by new owner"
+	if _, _, err := st.UpdateWorkspace(ctx, store.UpdateWorkspaceInput{
+		WorkspaceID: workspace.ID, ActorUserID: member.ID, Name: &updatedName,
+	}); err != nil {
+		t.Fatalf("expected new owner to preserve the previously published icon: %v", err)
+	}
+}
+
+func TestWorkspaceIconMigrationUpgradesExistingData(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st, err := Open("sqlite://" + filepath.Join(t.TempDir(), "clickclack.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	applySQLiteMigrationsBefore(t, ctx, st, "0021_workspace_icon_url.sql")
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO users (id, display_name, handle, created_at)
+		VALUES ('usr_icon_owner', 'Icon Owner', 'icon-owner', ?)`, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO workspaces (id, route_id, name, slug, created_at)
+		VALUES ('wsp_icon_upgrade', 'THQICONUPGRADE01', 'Icon Upgrade', 'icon-upgrade', ?)`, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `
+		INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+		VALUES ('wsp_icon_upgrade', 'usr_icon_owner', 'owner', ?)`, now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := st.GetWorkspace(ctx, "wsp_icon_upgrade", "usr_icon_owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workspace.IconURL != "" {
+		t.Fatalf("expected migrated workspace icon_url to default empty, got %#v", workspace)
+	}
+	if pending, err := st.ListPendingUploadCleanups(ctx, 10); err != nil || len(pending) != 0 {
+		t.Fatalf("expected upgraded cleanup queue to be available and empty, got %#v err=%v", pending, err)
+	}
+}
+
+func TestMutationsRejectInvalidInput(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channels[0].ID, AuthorID: owner.ID, Body: "body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: message.ID, UserID: owner.ID, Body: " "}); err == nil {
+		t.Fatal("expected empty message update error")
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: "missing", UserID: owner.ID, Body: "x"}); err == nil {
+		t.Fatal("expected missing message update error")
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: "missing", UserID: owner.ID}); err == nil {
+		t.Fatal("expected missing message delete error")
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: "missing", UserID: owner.ID}); err == nil {
+		t.Fatal("expected missing channel error")
+	}
+	outsider, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Outsider", Email: "outsider@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channels[0].ID, UserID: outsider.ID, Name: "nope"}); err == nil {
+		t.Fatal("expected outsider channel update error")
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: message.ID, UserID: outsider.ID, Body: "nope"}); err == nil {
+		t.Fatal("expected outsider message update error")
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: message.ID, UserID: outsider.ID}); err == nil {
+		t.Fatal("expected outsider message delete error")
+	}
+	member, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Member", Email: "member-mutations@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspaces[0].ID, member.ID, "member"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channels[0].ID, UserID: member.ID, Name: "member-edit"}); err == nil {
+		t.Fatal("expected non-owner member channel update error")
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: message.ID, UserID: member.ID, Body: "nope"}); err == nil {
+		t.Fatal("expected non-author member message update error")
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: message.ID, UserID: member.ID}); err == nil {
+		t.Fatal("expected non-author member message delete error")
+	}
+	moderator, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "Moderator", Email: "moderator-mutations@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddWorkspaceMember(ctx, workspaces[0].ID, moderator.ID, store.WorkspaceRoleModerator); err != nil {
+		t.Fatal(err)
+	}
+	memberMessage, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channels[0].ID, AuthorID: member.ID, Body: "delete my own"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedByAuthor, deleteEvents, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: memberMessage.ID, UserID: member.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deletedByAuthor.DeletedAt == nil || len(deleteEvents) != 1 || deleteEvents[0].Type != "message.deleted" {
+		t.Fatalf("expected author delete to soft-delete the message, got %#v %#v", deletedByAuthor, deleteEvents)
+	}
+	anotherMemberMessage, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channels[0].ID, AuthorID: member.ID, Body: "owner moderate me"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletedByOwner, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: anotherMemberMessage.ID, UserID: owner.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deletedByOwner.DeletedAt == nil {
+		t.Fatalf("expected owner delete to soft-delete the message, got %#v", deletedByOwner)
+	}
+	moderatorBlockedMessage, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channels[0].ID, AuthorID: member.ID, Body: "moderator cannot delete this"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: moderatorBlockedMessage.ID, UserID: moderator.ID}); !errors.Is(err, store.ErrMessageNotWritable) {
+		t.Fatalf("expected moderator non-author delete to be blocked, got %v", err)
+	}
+	dmMemberA, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "DM Member A", Email: "dm-a-mutations@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dmMemberB, err := st.CreateUser(ctx, store.CreateUserInput{DisplayName: "DM Member B", Email: "dm-b-mutations@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, dmMember := range []store.User{dmMemberA, dmMemberB} {
+		if err := st.AddWorkspaceMember(ctx, workspaces[0].ID, dmMember.ID, store.WorkspaceRoleMember); err != nil {
+			t.Fatal(err)
+		}
+	}
+	memberDM, err := st.CreateDirectConversation(ctx, store.CreateDirectConversationInput{WorkspaceID: workspaces[0].ID, UserID: dmMemberA.ID, MemberIDs: []string{dmMemberB.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	memberDMMessage, _, err := st.CreateDirectMessage(ctx, store.CreateDirectMessageInput{ConversationID: memberDM.ID, AuthorID: dmMemberA.ID, Body: "owner cannot delete private dm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: memberDMMessage.ID, UserID: owner.ID}); err == nil {
+		t.Fatal("expected owner outside DM to be blocked from deleting the message")
+	}
+	reactionMessage, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channels[0].ID, AuthorID: owner.ID, Body: "react"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstReaction, err := st.AddReaction(ctx, store.CreateReactionInput{MessageID: reactionMessage.ID, UserID: owner.ID, Emoji: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstReaction.ID == "" || firstReaction.Type != "reaction.added" {
+		t.Fatalf("unexpected first reaction event: %#v", firstReaction)
+	}
+	duplicateReaction, err := st.AddReaction(ctx, store.CreateReactionInput{MessageID: reactionMessage.ID, UserID: owner.ID, Emoji: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicateReaction.ID != "" {
+		t.Fatalf("duplicate reaction emitted event: %#v", duplicateReaction)
+	}
+	removedReaction, err := st.RemoveReaction(ctx, store.CreateReactionInput{MessageID: reactionMessage.ID, UserID: owner.ID, Emoji: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removedReaction.ID == "" || removedReaction.Type != "reaction.removed" {
+		t.Fatalf("unexpected remove reaction event: %#v", removedReaction)
+	}
+	missingReaction, err := st.RemoveReaction(ctx, store.CreateReactionInput{MessageID: reactionMessage.ID, UserID: owner.ID, Emoji: "ok"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missingReaction.ID != "" {
+		t.Fatalf("missing reaction emitted event: %#v", missingReaction)
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: message.ID, UserID: owner.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: message.ID, UserID: owner.ID, Body: "deleted body returns"}); err == nil {
+		t.Fatal("expected deleted message update error")
+	}
+	affected, err := st.q.UpdateMessageBody(ctx, storedb.UpdateMessageBodyParams{Body: "race edit", EditedAt: sqlText(now()), ID: message.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if affected != 0 {
+		t.Fatalf("deleted message update affected %d rows", affected)
+	}
+	reloaded, err := st.GetMessage(ctx, message.ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Body != "" {
+		t.Fatalf("deleted message body changed: %#v", reloaded)
+	}
+	results, err := st.SearchMessagePage(ctx, store.SearchPageRequest{
+		WorkspaceID: workspaces[0].ID,
+		ChannelID:   channels[0].ID,
+		UserID:      owner.ID,
+		Query:       "deleted body returns",
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results.Results) != 0 {
+		t.Fatalf("deleted message was searchable: %#v", results)
+	}
+}
+
+func TestMutationsReturnOutboxErrors(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := newTestStore(t)
+	owner, err := st.EnsureBootstrap(ctx, "Owner", "owner@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaces, err := st.ListWorkspaces(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	channels, err := st.ListChannels(ctx, workspaces[0].ID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, _, err := st.CreateMessage(ctx, store.CreateMessageInput{ChannelID: channels[0].ID, AuthorID: owner.ID, Body: "body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `DROP TABLE events`); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.UpdateChannel(ctx, store.UpdateChannelInput{ChannelID: channels[0].ID, UserID: owner.ID, Name: "after-events"}); err == nil {
+		t.Fatal("expected channel outbox error")
+	}
+	if _, _, err := st.UpdateMessage(ctx, store.UpdateMessageInput{MessageID: message.ID, UserID: owner.ID, Body: "after-events"}); err == nil {
+		t.Fatal("expected message update outbox error")
+	}
+	if _, _, err := st.DeleteMessage(ctx, store.DeleteMessageInput{MessageID: message.ID, UserID: owner.ID}); err == nil {
+		t.Fatal("expected message delete outbox error")
+	}
+}

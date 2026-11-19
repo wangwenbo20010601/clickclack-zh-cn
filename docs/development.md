@@ -1,0 +1,152 @@
+---
+read_when:
+  - setting up a fresh checkout
+  - changing the gate (lint/typecheck/test/build/coverage)
+  - adding a new package or tool to the monorepo
+---
+
+# Development
+
+The repo is a Go module plus a pnpm workspace. The Go binary embeds the
+built SPA, so a full local build runs both toolchains.
+
+## Prerequisites
+
+- Go (matching `go.mod`).
+- Keep `modernc.org/libc` at the exact version required by `modernc.org/sqlite`'s `go.mod`; SQLite's generated code and its runtime must be upgraded together. `pnpm check:sqlite-runtime` verifies this pairing.
+- pnpm 12.15.0, matching `packageManager` in `package.json`.
+- TypeScript runs via stable TypeScript 7 native `tsc` from `@typescript/native` — installed
+  through pnpm.
+- The OpenAPI generator has its own TypeScript 5 compiler API dependency, matching
+  its declared peer range; application typechecking still uses native TypeScript 7.
+- Lint/format use `oxlint` and `oxfmt` — installed through pnpm.
+
+## First run
+
+```sh
+pnpm install
+pnpm build                                          # builds SPA + SDK and copies dist into apps/api
+go run ./apps/api/cmd/clickclack serve --dev-bootstrap=true
+open http://localhost:8080
+```
+
+The explicit development bootstrap creates `Local Captain` as the first user, a `ClickClack`
+workspace, and a `general` channel, so the SPA loads into a working state on
+first hit.
+
+## Two-process dev loop
+
+```sh
+# terminal 1
+pnpm dev:api                                        # go run ... serve --dev-bootstrap=true
+
+# terminal 2
+pnpm dev:web                                        # vite dev server with API proxy
+```
+
+The Vite dev server proxies `/api` and `/api/realtime/ws` to `localhost:8080`.
+
+## Scripts
+
+| Command                | What it does |
+|------------------------|--------------|
+| `pnpm build`           | Builds the Svelte app and the SDK, then embeds `apps/web/dist` into `apps/api/internal/webassets/dist`. |
+| `pnpm build:web`       | Builds the Svelte app without touching embedded Go assets. Generated output is preserved byte-for-byte; whitespace inside JavaScript literals is significant. |
+| `pnpm build:sdk`       | Builds the TypeScript SDK. |
+| `pnpm build:desktop`   | Bundles the Electron main process, preloads, and settings renderer. |
+| `pnpm check`           | Full local gate: web/Go, FakeCo AWS and desktop tests, root/workspace `tsc`, `oxlint`, and format checks. |
+| `pnpm coverage`        | Go tests with coverage; fails under 85% line coverage. |
+| `pnpm dev:api`         | `go run ./apps/api/cmd/clickclack serve --dev-bootstrap=true`. |
+| `pnpm dev:web`         | `vite dev` for the SPA. |
+| `pnpm dev:desktop`     | Builds and starts the Electron client against its configured server. |
+| `pnpm fmt`             | `gofmt` + `oxfmt` over Go and TS/Svelte. |
+| `pnpm fmt:check`       | CI-compatible formatting check with `gofmt -l` and `oxfmt --check`. |
+| `pnpm lint`            | `oxlint` over web, SDK, examples, and tests. |
+| `goreleaser release --snapshot --clean` | Local release smoke test for all configured OS/arch targets. |
+| `pnpm typecheck`       | `tsc --noEmit -p tsconfig.json` for root Playwright config/tests. |
+| `pnpm test`            | Builds the web app and SDK, then runs Go tests against those fresh web assets in a temp copy without rewriting tracked embedded assets. |
+| `pnpm test:e2e`        | Playwright suite in `tests/e2e`. |
+| `pnpm test:desktop`    | Tests desktop URL, deep-link, notification, settings, and badge contracts. |
+
+`pnpm build` uses `CLICKCLACK_WEB_VERSION=dev` by default. That keeps repeated
+local builds deterministic while still allowing real source changes to update
+content-hashed assets. Release and Docker builds should set
+`CLICKCLACK_WEB_VERSION` to the commit or tag being shipped.
+
+SvelteKit configuration lives in `apps/web/vite.config.ts`, including the static
+adapter, explicit service-worker registration, and embedded app version.
+The web typecheck checks the application and service worker separately so each
+uses its browser or worker environment types.
+
+## Layout
+
+```
+apps/
+  api/                  # Go backend, single-binary entrypoint
+    cmd/clickclack/     # CLI main
+    internal/
+      authpolicy/       # public origins, cookies, and OAuth callback policy
+      passwordauth/     # password hashing and validation
+      config/           # flag/env/file resolution
+      httpapi/          # chi router and domain handlers; auth, realtime, and uploads
+      realtime/         # in-process pub/sub hub
+      store/            # store interface + types
+        sqlite/         # SQLite implementation, migrations, backup, export
+        postgres/       # Postgres implementation, migrations, export
+      webassets/        # go:embed for the built SPA
+  desktop/              # Electron shell, platform assets, settings, packaging
+  web/                  # Svelte 5 SPA
+packages/
+  protocol/             # OpenAPI spec, source of truth for the wire shape
+  sdk-ts/               # TypeScript SDK (generated types + friendly wrapper)
+examples/
+  bot-ts/               # SDK usage example
+infra/
+  migrations/sqlite     # mirror of embedded SQLite migrations for tooling
+  migrations/postgres   # mirror of embedded Postgres migrations for tooling
+tests/
+  e2e/                  # Playwright tests
+docs/                   # this directory
+```
+
+## Adding a feature
+
+1. Update `packages/protocol/openapi.yaml` first when the wire shape
+   changes. It is the contract.
+2. Add the store method on `apps/api/internal/store/types.go` and implement
+   it in both `apps/api/internal/store/sqlite` and
+   `apps/api/internal/store/postgres` when the feature touches durable state.
+3. Wire the handler in `apps/api/internal/httpapi`.
+4. Update the SDK in `packages/sdk-ts/src/index.ts` so TS clients have a
+   typed surface.
+5. Update or add a `docs/features/<thing>.md`.
+6. Run `pnpm check` and `pnpm coverage`.
+
+## Testing
+
+- `apps/api/internal/...` is the bulk of the test suite. Coverage gate is
+  85%.
+- `tests/e2e/` exercises the SPA end-to-end via Playwright, with focused suites
+  for chat, routing, authentication, embeds, artifacts, and message behavior.
+- The SDK has no standalone test target. Its build and the bot example's
+  typecheck are part of the local gate.
+
+CI runs web utility tests on Node.js 24 and 26 and builds the SDK on the minimum
+supported Node.js line. The Go job uses PostgreSQL 18 for database integration
+tests and runs every package once through the coverage
+gate, whose 85% aggregate still covers internal request and business logic.
+Browser and Docker jobs build their own inputs and
+start independently of the language checks.
+
+## Coding rules
+
+- IDs are sortable ULID-style with semantic prefixes (`usr_`, `wsp_`, `chn_`,
+  `msg_`, `evt_`, `upl_`, `idn_`).
+- Keep transactions short. Outbox events are inserted in the same tx as the
+  durable write that produced them.
+- Keep SQL behind the store interface. Dialect-specific SQL belongs in the
+  SQLite/Postgres store packages, not in HTTP handlers.
+- Use `sqlc` for typed SQL. Edit schema/query files, then run
+  `pnpm generate:sqlc`; do not hand-maintain generated `storedb` code.
+- TypeScript: no Svelte imports in `packages/sdk-ts`. The SDK must stay
+  framework-neutral.

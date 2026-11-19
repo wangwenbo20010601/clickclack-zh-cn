@@ -1,0 +1,106 @@
+export class APIError extends Error {
+  status: number;
+  constructor(status: number, body: string) {
+    super(body);
+    this.status = status;
+  }
+}
+
+export function readableAPIError(error: unknown, fallback: string): string {
+  if (!(error instanceof Error)) return fallback;
+  const message = error.message.trim();
+  if (!message) return fallback;
+  try {
+    const body = JSON.parse(message) as { error?: unknown };
+    if (typeof body.error === "string" && body.error.trim()) return body.error.trim();
+  } catch {
+    // Plain-text API errors are already suitable for display.
+  }
+  return message;
+}
+
+declare global {
+  interface Window {
+    __CLICKCLACK_CONFIG__?: {
+      apiBaseUrl?: string;
+      frontendBaseUrl?: string;
+      authMethods?: string[];
+    };
+  }
+}
+
+// Explicit capabilities are authoritative. Without metadata, preserve the
+// GitHub and OpenClaw ID links shown by older or separately hosted frontends.
+export function authMethods(): string[] {
+  if (typeof window === "undefined") return [];
+  const methods = window.__CLICKCLACK_CONFIG__?.authMethods;
+  return Array.isArray(methods) ? methods : ["github", "openclaw"];
+}
+
+export function apiBaseURL(): string {
+  if (typeof window === "undefined") return "";
+  return (window.__CLICKCLACK_CONFIG__?.apiBaseUrl || "").trim().replace(/\/$/, "");
+}
+
+export function frontendBaseURL(): string {
+  if (typeof window === "undefined") return "";
+  return (window.__CLICKCLACK_CONFIG__?.frontendBaseUrl || window.location.origin)
+    .trim()
+    .replace(/\/$/, "");
+}
+
+export function apiURL(path: string): string {
+  const base = apiBaseURL();
+  return base ? `${base}${path.startsWith("/") ? path : `/${path}`}` : path;
+}
+
+export function apiResourceURL(value: string): string {
+  return value.startsWith("/api/") ? apiURL(value) : value;
+}
+
+export const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
+
+export function applyDefaultFetchTimeout(init: RequestInit = {}): RequestInit {
+  if (init.signal || init.body instanceof FormData) return init;
+  return { ...init, signal: AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS) };
+}
+
+export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  const method = (init.method ?? "GET").toUpperCase();
+  headers.set("Accept", "application/json");
+  if (init.body && !(init.body instanceof FormData))
+    headers.set("Content-Type", "application/json");
+  if (!["GET", "HEAD", "OPTIONS", "TRACE"].includes(method)) headers.set("X-ClickClack-CSRF", "1");
+  const response = await fetch(
+    apiURL(path),
+    applyDefaultFetchTimeout({ ...init, credentials: "include", headers }),
+  );
+  if (!response.ok) {
+    throw new APIError(response.status, await response.text());
+  }
+  if (response.status === 204 || response.status === 205) {
+    return undefined as T;
+  }
+  const text = await response.text();
+  return text ? (JSON.parse(text) as T) : (undefined as T);
+}
+
+export async function apiWithTimeout<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const { signal } = init;
+  if (!signal) return api<T>(path, init);
+  signal.throwIfAborted();
+  // Keep caller cancellation and the deadline without requiring AbortSignal.any.
+  const controller = new AbortController();
+  const timeout = AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS);
+  const onCancel = () => controller.abort(signal.reason);
+  const onTimeout = () => controller.abort(timeout.reason);
+  signal.addEventListener("abort", onCancel, { once: true });
+  timeout.addEventListener("abort", onTimeout, { once: true });
+  try {
+    return await api<T>(path, { ...init, signal: controller.signal });
+  } finally {
+    signal.removeEventListener("abort", onCancel);
+    timeout.removeEventListener("abort", onTimeout);
+  }
+}

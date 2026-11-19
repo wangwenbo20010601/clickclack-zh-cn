@@ -1,0 +1,855 @@
+<script lang="ts">
+  import { onDestroy, onMount, tick } from "svelte";
+  import ChatComposer from "../composer/ChatComposer.svelte";
+  import ImageViewer from "../media/ImageViewer.svelte";
+  import KeystrokeMark from "../KeystrokeMark.svelte";
+  import ProfilePane from "../profile/ProfilePane.svelte";
+  import MessageList, {
+    type MessageListHandle,
+    type MessageListState,
+  } from "../messages/MessageList.svelte";
+  import { markdownImageViewerURL } from "../../lib/actions/markdown";
+  import { APIError, api, apiResourceURL, readableAPIError } from "../../lib/api";
+  import { requestCurrentUser } from "../../lib/appearance";
+  import { channelDisplayTitle } from "../../lib/chat/channels";
+  import { newNonce } from "../../lib/chat/messages";
+  import { MessageRequests } from "../../lib/chat/messageRequests";
+  import { listAllWorkspaceMembers, memberLoadErrorMessage } from "../../lib/workspace-members";
+  import {
+    MessageEditController,
+    type MessageEdit,
+    type MessageEditSession,
+  } from "../../lib/messageEditing.svelte";
+  import { ReactionController } from "../../lib/reactions.svelte";
+  import { connectRealtime, WorkspaceUnavailableError, type RealtimeConnection } from "../../lib/realtime.svelte";
+  import type {
+    Channel,
+    Message,
+    MessagePage,
+    RealtimeEvent,
+    RouteTarget,
+    Upload,
+    User,
+  } from "../../lib/types";
+
+  type Props = {
+    workspaceRouteID: string;
+    channelRouteID: string;
+  };
+
+  type MessageSubmission = {
+    body: string;
+    nonce: string;
+    quotedMessageID?: string;
+  };
+
+  type ViewState = "loading" | "ready" | "auth" | "forbidden" | "not-found" | "error";
+
+  let { workspaceRouteID, channelRouteID }: Props = $props();
+
+  let viewState = $state<ViewState>("loading");
+  let errorText = $state("");
+  let user = $state<User | null>(null);
+  const reactionController = new ReactionController(() => user?.id || "");
+  const editController = new MessageEditController(revealEditSession);
+  let route = $state<RouteTarget | null>(null);
+  let channel = $state<Channel | null>(null);
+  let messages = $state<Message[]>([]);
+  let oldestSeq = $state(0);
+  let newestSeq = $state(0);
+  let hasOlder = $state(false);
+  let hasNewer = $state(false);
+  let loadingOlder = $state(false);
+  let messageBody = $state("");
+  let replyTarget = $state<Message | null>(null);
+  let messageInput = $state<HTMLTextAreaElement | null>(null);
+  let messageList = $state<MessageListHandle | null>(null);
+  let restoreState = $state<MessageListState | undefined>();
+  let sendError = $state("");
+  let realtimeError = $state("");
+  let sending = $state(false);
+  let selectedImage = $state<{ url: string; title: string } | null>(null);
+  let selectedProfile = $state<User | null>(null);
+  let socket: RealtimeConnection | null = null;
+  let loadSerial = 0;
+  let loadPending = false;
+  let messageSubmission: MessageSubmission | null = null;
+  let workspaceMemberUsers = $state<User[]>([]);
+  let memberLoadSerial = 0;
+  let memberLoadAbort: AbortController | null = null;
+  let memberLoadError = $state("");
+  let loadingNewerSerial: number | null = null;
+  const messageRequests = new MessageRequests(() => [user?.id, channel?.id].join(":"));
+
+  const mentionPeople = $derived.by(() => {
+    const people = new Map<string, User>();
+    for (const person of workspaceMemberUsers) {
+      if (person.id && !person.deleted_at) people.set(person.id, person);
+    }
+    for (const message of messages) {
+      if (message.author?.id && message.author.handle?.trim() && !message.author.deleted_at) {
+        people.set(message.author.id, message.author);
+      }
+    }
+    if (user?.id) people.set(user.id, user);
+    return [...people.values()];
+  });
+
+  async function loadWorkspaceMembers(workspaceID: string) {
+    const serial = ++memberLoadSerial;
+    memberLoadAbort?.abort();
+    const controller = new AbortController();
+    memberLoadAbort = controller;
+    memberLoadError = "";
+    workspaceMemberUsers = [];
+    try {
+      const members = await listAllWorkspaceMembers({ workspaceID, limit: 100, signal: controller.signal });
+      if (serial === memberLoadSerial) workspaceMemberUsers = members.map((member) => member.user);
+    } catch (error) {
+      if (!controller.signal.aborted && serial === memberLoadSerial) {
+        workspaceMemberUsers = [];
+        memberLoadError = memberLoadErrorMessage(error);
+      }
+    }
+  }
+
+  async function revealEditSession(scope: string, session: MessageEditSession) {
+    if (scope !== channel?.id) return;
+    messageList?.scrollToMessage(session.messageID);
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      await tick();
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const editor = document
+        .querySelector(".embed-channel-shell")
+        ?.querySelector(`[data-message-id="${CSS.escape(session.messageID)}"]`)
+        ?.querySelector<HTMLTextAreaElement>('textarea[aria-label="编辑消息"]');
+      if (!editor) continue;
+      editor.focus();
+      return;
+    }
+  }
+
+  function applyEditedMessage(updated: MessageEdit) {
+    messages = messages.map(messageRequests.updateMessage(updated));
+  }
+
+  function mergeMessages(...lists: Message[][]): Message[] {
+    const byID = new Map<string, Message>();
+    for (const list of lists) {
+      for (const message of list) byID.set(message.id, message);
+    }
+    return [...byID.values()].sort(
+      (a, b) => (a.channel_seq || 0) - (b.channel_seq || 0),
+    );
+  }
+
+  function applyPage(page: MessagePage, mode: "replace" | "prepend" | "append") {
+    if (mode === "replace") restoreState = undefined;
+    reactionController.seedMessages(page.messages);
+    messages =
+      mode === "replace"
+        ? page.messages
+        : mode === "prepend"
+          ? mergeMessages(page.messages, messages)
+          : mergeMessages(messages, page.messages);
+    editController.reconcile(channel?.id || "", messages);
+    // A displayed send receipt does not prove the intervening messages were fetched.
+    if (mode === "replace") {
+      oldestSeq = page.oldest_seq;
+      newestSeq = page.newest_seq;
+      hasOlder = page.has_older;
+      hasNewer = page.has_newer;
+    } else {
+      oldestSeq = Math.min(oldestSeq || page.oldest_seq, page.oldest_seq || oldestSeq);
+      if (mode === "prepend") hasOlder = page.has_older;
+      if (mode === "append") {
+        if (page.newest_seq > newestSeq) hasNewer = page.has_newer;
+        else if (page.newest_seq === newestSeq) hasNewer ||= page.has_newer;
+      }
+      newestSeq = Math.max(newestSeq, page.newest_seq);
+    }
+  }
+
+  function clearChannel() {
+    messageRequests.clear();
+    messageSubmission = null;
+    sending = false;
+    sendError = "";
+    memberLoadSerial += 1;
+    memberLoadAbort?.abort();
+    socket?.close();
+    socket = null;
+    route = null;
+    channel = null;
+    reactionController.clear();
+    editController.clear();
+    messages = [];
+    restoreState = undefined;
+    oldestSeq = 0;
+    newestSeq = 0;
+    hasOlder = false;
+    hasNewer = false;
+    loadingOlder = false;
+    loadingNewerSerial = null;
+    replyTarget = null;
+    selectedProfile = null;
+    selectedImage = null;
+  }
+
+  function handleLoadError(error: unknown) {
+    clearChannel();
+    if (error instanceof WorkspaceUnavailableError) {
+      viewState = "forbidden";
+      return;
+    }
+    if (error instanceof APIError) {
+      if (error.status === 401) {
+        viewState = "auth";
+        return;
+      }
+      if (error.status === 403) {
+        viewState = "forbidden";
+        return;
+      }
+      if (error.status === 404) {
+        viewState = "not-found";
+        return;
+      }
+    }
+    errorText = readableAPIError(error, "无法加载此频道。");
+    viewState = "error";
+  }
+
+  async function loadChannel() {
+    if (loadPending) return;
+    loadPending = true;
+    const serial = ++loadSerial;
+    if (viewState !== "auth") viewState = "loading";
+    errorText = "";
+    try {
+      const me = await requestCurrentUser();
+      const resolved = await api<{ route: RouteTarget }>(
+        `/api/routes/${encodeURIComponent(workspaceRouteID)}/${encodeURIComponent(channelRouteID)}`,
+      );
+      if (resolved.route.target_type !== "channel") {
+        throw new APIError(404, "找不到频道路径");
+      }
+      await readChannelSnapshot(resolved.route.workspace_id, resolved.route.target_id, (snapshot) => {
+        if (user && user.id !== me.user.id) messageBody = "";
+        user = me.user;
+        route = resolved.route;
+        void loadWorkspaceMembers(resolved.route.workspace_id);
+        channel = snapshot.channel;
+        applyPage(snapshot, "replace");
+        viewState = "ready";
+        connectSocket(resolved.route.workspace_id);
+      }, () => serial === loadSerial);
+    } catch (error) {
+      if (serial === loadSerial) handleLoadError(error);
+    } finally {
+      if (serial === loadSerial) loadPending = false;
+    }
+  }
+
+  async function loadOlderMessages() {
+    if (!channel || loadingOlder || !hasOlder || oldestSeq <= 0) return;
+    const channelID = channel.id;
+    const serial = loadSerial;
+    loadingOlder = true;
+    try {
+      await messageRequests.run(() => api<MessagePage>(
+        `/api/channels/${encodeURIComponent(channelID)}/messages?before_seq=${encodeURIComponent(String(oldestSeq))}&limit=100`,
+      ), (page) => {
+        // Preserve scrolling that happened while the page was loading.
+        restoreState = messageList?.captureState() ?? undefined;
+        applyPage(page, "prepend");
+      }, () => serial === loadSerial && channel?.id === channelID && viewState === "ready");
+    } catch (error) {
+      if (serial === loadSerial) sendError = readableAPIError(error, "无法加载更早的消息。");
+    } finally {
+      if (serial === loadSerial) loadingOlder = false;
+    }
+  }
+
+  async function loadNewerMessages() {
+    const serial = loadSerial;
+    if (loadingNewerSerial === serial || !hasNewer) return;
+    loadingNewerSerial = serial;
+    try {
+      await syncNewMessages(() => serial === loadSerial);
+    } catch (error) {
+      if (serial === loadSerial) reportRealtimeError(error);
+    } finally {
+      if (loadingNewerSerial === serial) loadingNewerSerial = null;
+    }
+  }
+
+  function readChannelSnapshot(
+    workspaceID: string,
+    channelID: string,
+    commit: (snapshot: MessagePage & { channel: Channel }) => void,
+    current: () => boolean,
+  ) {
+    return messageRequests.run(async () => {
+      const [channelData, page] = await Promise.all([
+        api<{ channels: Channel[] }>(`/api/workspaces/${encodeURIComponent(workspaceID)}/channels`),
+        api<MessagePage>(`/api/channels/${encodeURIComponent(channelID)}/messages?limit=100`),
+      ]);
+      const channel = channelData.channels.find((candidate) => candidate.id === channelID);
+      if (!channel) throw new APIError(404, "找不到频道");
+      return { ...page, channel };
+    }, commit, current);
+  }
+
+  async function reconcileChannelSnapshot(isCurrent: () => boolean = () => true) {
+    if (!route || !channel || viewState !== "ready") return;
+    const workspaceID = route.workspace_id;
+    const channelID = channel.id;
+    const serial = loadSerial;
+    await readChannelSnapshot(workspaceID, channelID, (snapshot) => {
+      // Replace the page owner while retaining pending updates for this channel's rows.
+      loadSerial++;
+      messageRequests.prune();
+      loadingOlder = false;
+      loadingNewerSerial = null;
+      channel = snapshot.channel;
+      applyPage(snapshot, "replace");
+    }, () => isCurrent() && serial === loadSerial && channel?.id === channelID && viewState === "ready");
+  }
+
+  async function syncNewMessages(isCurrent: () => boolean = () => true) {
+    if (!channel || viewState !== "ready") return;
+    const channelID = channel.id;
+    const serial = loadSerial;
+    const current = () => isCurrent() && serial === loadSerial &&
+      channel?.id === channelID && viewState === "ready";
+    try {
+      let cursor = newestSeq;
+      for (let pageCount = 0; pageCount < 20; pageCount++) {
+        const page = await messageRequests.run(() => api<MessagePage>(
+          `/api/channels/${encodeURIComponent(channelID)}/messages?after_seq=${encodeURIComponent(String(cursor))}&limit=100`,
+        ), (page) => applyPage(page, "append"), current);
+        if (!page || !current()) return;
+        const nextCursor = page.newest_seq || cursor;
+        if (!page.has_newer || nextCursor <= cursor) {
+          clearRealtimeError();
+          return;
+        }
+        cursor = nextCursor;
+      }
+      throw new Error("实时消息恢复超出页数限制");
+    } catch (error) {
+      if (!current()) return;
+      throw error;
+    }
+  }
+
+  async function refreshMessage(messageID: string, isCurrent: () => boolean = () => true) {
+    if (!messages.some((message) => message.id === messageID) && !messageRequests.pending) return;
+    await messageRequests.run(() => api<{ message: Message }>(
+      `/api/messages/${encodeURIComponent(messageID)}`,
+    ), (data) => {
+      applyEditedMessage(data.message);
+      editController.reconcile(channel?.id || "", messages);
+    }, isCurrent);
+  }
+
+  async function refreshChannelMetadata(isCurrent: () => boolean = () => true) {
+    if (!route || !channel) return;
+    const data = await api<{ channels: Channel[] }>(
+      `/api/workspaces/${encodeURIComponent(route.workspace_id)}/channels`,
+    );
+    if (!isCurrent()) return;
+    const refreshed = data.channels.find((candidate) => candidate.id === channel?.id);
+    if (!refreshed) throw new APIError(404, "找不到频道");
+    channel = refreshed;
+  }
+
+  function eventChannelID(event: RealtimeEvent): string {
+    return event.channel_id || event.payload.channel_id || "";
+  }
+
+  async function handleRealtimeEvent(event: RealtimeEvent, isCurrent: () => boolean) {
+    if (!channel || eventChannelID(event) !== channel.id) return;
+    if (event.type === "message.created") {
+      const eventSeq = event.seq || event.payload.seq || 0;
+      if (eventSeq > 0 && eventSeq <= newestSeq) return;
+      await syncNewMessages(isCurrent);
+      return;
+    }
+    if (event.type === "message.updated" || event.type === "message.deleted") {
+      if (event.payload.message_id) await refreshMessage(event.payload.message_id, isCurrent);
+      return;
+    }
+    if (event.type === "reaction.added" || event.type === "reaction.removed") {
+      reactionController.applyEvent(event);
+      return;
+    }
+    if (event.type === "channel.updated") await refreshChannelMetadata(isCurrent);
+  }
+
+  function reportRealtimeError(error: unknown) {
+    if (viewState === "ready") {
+      if (error instanceof WorkspaceUnavailableError || (error instanceof APIError && [401, 403, 404].includes(error.status))) {
+        handleLoadError(error);
+        return;
+      }
+      realtimeError = readableAPIError(error, "无法处理实时更新。");
+      sendError = realtimeError;
+    }
+  }
+
+  function clearRealtimeError() {
+    if (sendError === realtimeError) sendError = "";
+    realtimeError = "";
+  }
+
+  function connectSocket(workspaceID: string) {
+    socket?.close();
+    socket = connectRealtime({
+      workspaceID,
+      onEvent: handleRealtimeEvent,
+      onOpen: async (isCurrent, authoritativeResync) => {
+        if (authoritativeResync) {
+          reactionController.clear();
+          await reconcileChannelSnapshot(isCurrent);
+        }
+        if (!isCurrent()) return;
+        clearRealtimeError();
+      },
+      onError: reportRealtimeError,
+    });
+  }
+
+  async function sendMessage() {
+    const body = messageBody.trim();
+    if (!body || !channel || sending) return;
+    const channelID = channel.id;
+    const quotedMessageID = replyTarget?.id;
+    const submission =
+      messageSubmission?.body === body &&
+      messageSubmission.quotedMessageID === quotedMessageID
+        ? messageSubmission
+        : { body, nonce: newNonce(), quotedMessageID };
+    // Sends survive window resyncs; clearChannel retires their completion owner.
+    messageSubmission = submission;
+    sendError = "";
+    sending = true;
+    let message: Message;
+    try {
+      ({ message } = await api<{ message: Message }>(
+        `/api/channels/${encodeURIComponent(channelID)}/messages`,
+        { method: "POST", body: JSON.stringify({ body, nonce: submission.nonce, quoted_message_id: quotedMessageID }) },
+      ));
+    } catch (error) {
+      if (messageSubmission !== submission) return;
+      if (error instanceof APIError && error.status === 401) {
+        handleLoadError(error);
+        return;
+      }
+      sendError = readableAPIError(error, "无法发送此消息。");
+      return;
+    } finally {
+      if (messageSubmission === submission) sending = false;
+    }
+    if (messageSubmission !== submission || channel?.id !== channelID || viewState !== "ready") return;
+    messageSubmission = null;
+    // A creation receipt cannot replace a row already observed through a read or edit.
+    messages = mergeMessages([message], messages);
+    if (messageBody.trim() === body) messageBody = "";
+    if (quotedMessageID && replyTarget?.id === quotedMessageID) replyTarget = null;
+    const serial = loadSerial;
+    void syncNewMessages(() => serial === loadSerial).catch((error) => {
+      if (serial === loadSerial) reportRealtimeError(error);
+    });
+    await tick();
+    if (serial === loadSerial && channel?.id === channelID && viewState === "ready") await messageList?.scrollToBottom();
+  }
+
+  function handleComposerKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape" && replyTarget) {
+      event.preventDefault();
+      replyTarget = null;
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void sendMessage();
+    }
+  }
+
+  function setReplyTarget(message: Message) {
+    if (sending) return;
+    replyTarget = message;
+    void tick().then(() => messageInput?.focus());
+  }
+
+  function jumpToQuote(message: Message) {
+    if (message.quoted_message_id) messageList?.scrollToMessage(message.quoted_message_id);
+  }
+
+  function openThread(message: Message) {
+    if (!message.route_id) return;
+    const opened = window.open(
+      `/app/${encodeURIComponent(workspaceRouteID)}/${encodeURIComponent(message.route_id)}`,
+      "_blank",
+      "noopener,noreferrer",
+    );
+    if (opened) opened.opener = null;
+  }
+
+  function handleInlineImagePointerUp(event: PointerEvent) {
+    const target = event.target;
+    if (!(target instanceof HTMLImageElement) || !target.closest(".markdown")) return;
+    event.preventDefault();
+    selectedImage = { url: markdownImageViewerURL(target), title: target.alt || "图片" };
+  }
+
+  function openArtifact(upload: Upload) {
+    const opened = window.open(
+      apiResourceURL(`/api/uploads/${upload.id}`),
+      "_blank",
+      "noopener,noreferrer",
+    );
+    if (opened) opened.opener = null;
+  }
+
+  function retryAuthOnFocus() {
+    if (viewState === "auth" && document.visibilityState === "visible") void loadChannel();
+  }
+
+  function openProfileDialog(node: HTMLDialogElement) {
+    node.showModal();
+    return { destroy: () => node.close() };
+  }
+
+  onMount(() => {
+    void loadChannel();
+    window.addEventListener("focus", retryAuthOnFocus);
+    document.addEventListener("visibilitychange", retryAuthOnFocus);
+  });
+
+  onDestroy(() => {
+    loadSerial += 1;
+    clearChannel();
+    window.removeEventListener("focus", retryAuthOnFocus);
+    document.removeEventListener("visibilitychange", retryAuthOnFocus);
+  });
+</script>
+
+<svelte:head>
+  <title>{channel ? `#${channelDisplayTitle(channel)} · ClickClack` : "ClickClack 频道"}</title>
+  <meta name="color-scheme" content="light dark" />
+</svelte:head>
+
+{#if viewState === "ready" && channel && route}
+  <main class="embed-channel-shell" aria-label="嵌入式频道">
+    <header class="embed-channel-header">
+      <div>
+        <span class="embed-channel-glyph" aria-hidden="true">#</span>
+        <h1>{channelDisplayTitle(channel)}</h1>
+        {#if channel.archived_at}<span class="embed-channel-status">已归档</span>{/if}
+      </div>
+    </header>
+    <MessageList
+      {messages}
+      selectedChannel={channel}
+      {mentionPeople}
+      viewKey={channel.id}
+      {hasOlder}
+      {hasNewer}
+      {loadingOlder}
+      {restoreState}
+      currentUserID={user?.id}
+      {reactionController}
+      {editController}
+      editScope={channel.id}
+      onMessageEdited={applyEditedMessage}
+      onListRef={(handle) => (messageList = handle)}
+      onActivateMessageComposer={() => {}}
+      onInlineImagePointerUp={handleInlineImagePointerUp}
+      onOpenProfile={(profile) => (selectedProfile = profile || null)}
+      onReply={(message) => setReplyTarget(message)}
+      onOpenThread={openThread}
+      onJumpToQuote={jumpToQuote}
+      onOpenImage={(url, title) => (selectedImage = { url, title })}
+      onOpenArtifact={openArtifact}
+      onLoadOlder={() => void loadOlderMessages()}
+      onLoadNewer={() => void loadNewerMessages()}
+    />
+    <div class="embed-channel-composer-dock">
+      {#if memberLoadError}<p class="embed-notice" role="status">提及功能不可用：{memberLoadError}</p>{/if}
+      {#if sendError}<p class="embed-notice" role="status">{sendError}</p>{/if}
+      <ChatComposer
+        value={messageBody}
+        placeholder={`向 #${channelDisplayTitle(channel)} 发送消息`}
+        ariaLabel="消息正文"
+        submitLabel="发送"
+        formClass="composer embed-channel-composer"
+        disabled={sending}
+        replyTarget={replyTarget}
+        showToolbar
+        {mentionPeople}
+        onValue={(value) => (messageBody = value)}
+        onSubmit={() => void sendMessage()}
+        onKeydown={handleComposerKeydown}
+        onFocus={() => (sendError = "")}
+        onInputRef={(node) => (messageInput = node)}
+        onClearReply={() => (replyTarget = null)}
+      />
+    </div>
+  </main>
+{:else if viewState === "auth"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" aria-label="登录">
+      <KeystrokeMark class="embed-mark" size={42} />
+      <h1>登录 ClickClack</h1>
+      <p>请在新标签页中打开 ClickClack，登录后返回此处。面板将自动重新连接。</p>
+      <a class="embed-action" href="/app" target="_blank" rel="noopener">打开 ClickClack</a>
+    </section>
+  </main>
+{:else if viewState === "forbidden"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" role="alert">
+      <h1>频道不可用</h1>
+      <p>你尚未加入此工作区，或无权查看此频道。</p>
+    </section>
+  </main>
+{:else if viewState === "not-found"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" role="alert">
+      <h1>找不到频道</h1>
+      <p>此频道可能已被移除，或链接有误。</p>
+    </section>
+  </main>
+{:else if viewState === "error"}
+  <main class="embed-state-shell">
+    <section class="embed-state-card" role="alert">
+      <h1>无法加载此频道</h1>
+      <p>{errorText}</p>
+      <button class="embed-action" type="button" onclick={() => void loadChannel()}>重试</button>
+    </section>
+  </main>
+{:else}
+  <main class="embed-state-shell" aria-label="正在加载频道">
+    <div class="embed-loading" aria-hidden="true"><span></span><span></span><span></span></div>
+  </main>
+{/if}
+
+{#if selectedImage}
+  <ImageViewer
+    url={selectedImage.url}
+    title={selectedImage.title}
+    onClose={() => (selectedImage = null)}
+  />
+{/if}
+
+{#if selectedProfile}
+  <dialog
+    class="embed-profile thread open"
+    aria-label="个人资料"
+    use:openProfileDialog
+    onclose={() => (selectedProfile = null)}
+  >
+    <ProfilePane profile={selectedProfile} currentUser={user} onClose={() => (selectedProfile = null)} />
+  </dialog>
+{/if}
+
+<style>
+  .embed-profile {
+    width: min(400px, calc(100% - 24px));
+    max-height: calc(100dvh - 24px);
+    padding: 0;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    color: var(--text);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .embed-profile::backdrop {
+    background: rgba(5, 8, 15, 0.54);
+  }
+
+  .embed-channel-shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    height: 100vh;
+    height: 100dvh;
+    min-width: 0;
+    overflow: hidden;
+    background: var(--bg);
+  }
+
+  .embed-channel-header {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+
+  .embed-channel-header > div {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .embed-channel-header h1 {
+    overflow: hidden;
+    margin: 0;
+    color: var(--text-strong);
+    font-family: var(--font-display);
+    font-size: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .embed-channel-glyph {
+    color: var(--accent);
+    font-weight: 800;
+  }
+
+  .embed-channel-status {
+    padding: 2px 6px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .embed-channel-shell :global(.messages) {
+    min-height: 0;
+  }
+
+  .embed-channel-composer-dock {
+    position: relative;
+  }
+
+  .embed-channel-composer-dock :global(.embed-channel-composer) {
+    --composer-card-top: 6px;
+    --composer-overlay-inset-x: 14px;
+
+    padding: 6px 14px 12px;
+  }
+
+  .embed-notice {
+    margin: 6px 14px 0;
+    padding: 9px 11px;
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--danger) 9%, var(--panel));
+    color: var(--danger);
+    font-size: 12px;
+    box-shadow: var(--shadow);
+  }
+
+  .embed-state-shell {
+    display: grid;
+    min-height: 100vh;
+    min-height: 100dvh;
+    place-items: center;
+    padding: 24px;
+    background:
+      radial-gradient(color-mix(in srgb, var(--text) 5%, transparent) 1px, transparent 1.5px) 0 0 / 18px 18px,
+      var(--bg);
+  }
+
+  .embed-state-card {
+    display: grid;
+    gap: 12px;
+    width: min(100%, 360px);
+    padding: 28px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-xl);
+    background: var(--panel);
+    box-shadow: var(--key-edge), var(--shadow);
+    text-align: center;
+  }
+
+  .embed-state-card h1,
+  .embed-state-card p {
+    margin: 0;
+  }
+
+  .embed-state-card h1 {
+    color: var(--text-strong);
+    font-family: var(--font-display);
+    font-size: 22px;
+  }
+
+  .embed-state-card p {
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  /* :global reaches the mark component's root, which Svelte does not scope. */
+  .embed-state-card :global(.embed-mark) {
+    margin: 0 auto 2px;
+    box-shadow:
+      inset 0 0 0 1px rgba(190, 210, 255, 0.13),
+      var(--key-edge);
+  }
+
+  .embed-action {
+    display: inline-flex;
+    min-height: 40px;
+    align-items: center;
+    justify-content: center;
+    margin-top: 4px;
+    padding: 0 16px;
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--line));
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: var(--accent-contrast);
+    font: inherit;
+    font-weight: 700;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .embed-action:hover {
+    background: var(--accent-hover);
+  }
+
+  .embed-loading {
+    display: flex;
+    gap: 7px;
+  }
+
+  .embed-loading span {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: embed-pulse 900ms ease-in-out infinite alternate;
+  }
+
+  .embed-loading span:nth-child(2) {
+    animation-delay: 150ms;
+  }
+
+  .embed-loading span:nth-child(3) {
+    animation-delay: 300ms;
+  }
+
+  @keyframes embed-pulse {
+    to {
+      opacity: 0.25;
+      transform: translateY(-4px);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .embed-loading span {
+      animation: none;
+    }
+  }
+</style>
